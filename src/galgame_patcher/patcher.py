@@ -1,20 +1,20 @@
-"""Galgame 补丁安装、校验、自动备份与一键回滚核心逻辑。"""
+"""Galgame 补丁安装、在线下载、校验、自动备份与一键回滚核心逻辑。"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import shutil
-import tarfile
 import tempfile
-import zipfile
-from pathlib import Path, PurePosixPath
-from typing import Optional, Union
+from pathlib import Path
+from typing import Optional, Sequence, Union
 
+from .archive import extract_archive, is_supported_archive
+from .catalog import PatchCatalog
+from .downloader import ProgressCallback, download_patch, is_url
 from .locator import SteamLocator
-from .models import GameProfile, PatchResult
+from .models import CatalogEntry, GameProfile, PatchResult
 
-_TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
 _CHUNK_SIZE = 1024 * 1024
 
 
@@ -34,65 +34,8 @@ def compute_sha256(file_path: Union[str, Path]) -> str:
     return digest.hexdigest().lower()
 
 
-def _is_zip_archive(path: Path) -> bool:
-    return path.suffix.lower() == ".zip"
-
-
-def _is_tar_archive(path: Path) -> bool:
-    lower_name = path.name.lower()
-    return any(lower_name.endswith(suffix) for suffix in _TAR_SUFFIXES)
-
-
-def _resolve_safe_member_path(base_dir: Path, member_name: str) -> Path:
-    """校验归档成员路径，防止路径遍历（Zip Slip）越界写入。"""
-    normalized = member_name.replace("\\", "/").lstrip("/")
-    pure = PurePosixPath(normalized)
-    if member_name.startswith(("/", "\\")) or ".." in pure.parts:
-        raise ValueError(f"检测到不安全的压缩包路径: {member_name!r}")
-
-    resolved_base = base_dir.resolve()
-    target = (resolved_base / Path(*pure.parts)).resolve()
-    try:
-        target.relative_to(resolved_base)
-    except ValueError as exc:
-        raise ValueError(f"压缩包成员路径越界: {member_name!r}") from exc
-    return target
-
-
-def _safe_extract_archive(archive_path: Path, extract_dir: Path) -> None:
-    """安全解压 .zip 或 .tar* 归档文件到临时目录。"""
-    if _is_zip_archive(archive_path):
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            for info in zf.infolist():
-                if not info.filename or info.filename.endswith(("/", "\\")):
-                    continue
-                target = _resolve_safe_member_path(extract_dir, info.filename)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info, "r") as src, target.open("wb") as dst:
-                    shutil.copyfileobj(src, dst)
-        return
-
-    if _is_tar_archive(archive_path):
-        with tarfile.open(archive_path, "r:*") as tf:
-            for member in tf.getmembers():
-                if member.isdir():
-                    continue
-                if member.issym() or member.islnk() or not member.isfile():
-                    raise ValueError(f"压缩包包含不支持的特殊文件类型: {member.name!r}")
-                target = _resolve_safe_member_path(extract_dir, member.name)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                extracted = tf.extractfile(member)
-                if extracted is None:
-                    continue
-                with extracted, target.open("wb") as dst:
-                    shutil.copyfileobj(extracted, dst)
-        return
-
-    raise ValueError(f"不支持的压缩包格式: {archive_path.name}")
-
-
 class GalgamePatcher:
-    """Galgame 补丁安装器，支持自动定位、校验、覆盖安装、原文件备份与回滚。"""
+    """Galgame 补丁安装器，支持自动定位、在线下载、密码解压、备份与回滚。"""
 
     BACKUP_FOLDER_NAME = ".galpatch_backup"
 
@@ -112,11 +55,21 @@ class GalgamePatcher:
         backup: bool = True,
         expected_sha256: Optional[str] = None,
         strip_single_top_dir: bool = True,
+        password: Optional[str] = None,
+        password_candidates: Optional[Sequence[str]] = None,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> PatchResult:
-        """将单文件、目录或压缩包补丁一键安装到目标 Galgame 目录。"""
-        source_path = Path(patch_source)
-        if not source_path.exists():
-            raise FileNotFoundError(f"补丁源路径不存在: {source_path}")
+        """将本地文件/目录/压缩包或远程 URL 补丁一键安装到目标 Galgame 目录。"""
+        if is_url(patch_source):
+            source_path = download_patch(
+                str(patch_source),
+                expected_sha256=expected_sha256,
+                progress_callback=progress_callback,
+            )
+        else:
+            source_path = Path(patch_source)
+            if not source_path.exists():
+                raise FileNotFoundError(f"补丁源路径不存在: {source_path}")
 
         if expected_sha256 is not None:
             if not source_path.is_file():
@@ -146,6 +99,8 @@ class GalgamePatcher:
                 dest_root=dest_root,
                 temp_dir=temp_dir,
                 strip_single_top_dir=strip_single_top_dir,
+                password=password,
+                password_candidates=password_candidates,
             )
 
             return self._install_files(
@@ -153,6 +108,45 @@ class GalgamePatcher:
                 game_dir=resolved_game_dir,
                 backup=backup,
             )
+
+    def apply_from_catalog(
+        self,
+        entry_or_query: Union[CatalogEntry, str, int],
+        *,
+        catalog: Optional[PatchCatalog] = None,
+        game_dir: Optional[Union[str, Path]] = None,
+        backup: bool = True,
+        password: Optional[str] = None,
+        password_candidates: Optional[Sequence[str]] = None,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> PatchResult:
+        """从补丁源清单中检索游戏条目，自动下载并安装对应补丁。"""
+        if isinstance(entry_or_query, CatalogEntry):
+            entry = entry_or_query
+        else:
+            active_catalog = catalog or PatchCatalog.default()
+            found = active_catalog.find_entry(entry_or_query)
+            if found is None:
+                raise LookupError(f"清单中未找到匹配的游戏条目: {entry_or_query!r}")
+            entry = found
+
+        if not entry.patch_url or not entry.patch_url.strip():
+            raise ValueError(
+                f"游戏 '{entry.name}' 尚未配置补丁下载链接 (patch_url)，"
+                "请导入包含有效链接的自定义清单 JSON 或手动选择本地补丁文件。"
+            )
+
+        return self.apply(
+            patch_source=entry.patch_url,
+            game_dir=game_dir,
+            profile=entry.to_game_profile(),
+            target_subdir=entry.target_subdir,
+            backup=backup,
+            expected_sha256=entry.expected_sha256,
+            password=password if password is not None else entry.archive_password,
+            password_candidates=password_candidates,
+            progress_callback=progress_callback,
+        )
 
     def rollback(self, game_dir: Union[str, Path]) -> PatchResult:
         """根据备份清单将游戏目录还原至打补丁前的状态并清理备份。"""
@@ -240,13 +234,20 @@ class GalgamePatcher:
         dest_root: Path,
         temp_dir: Path,
         strip_single_top_dir: bool,
+        password: Optional[str],
+        password_candidates: Optional[Sequence[str]],
     ) -> list[tuple[Path, Path]]:
         """将各种补丁源解析为 (源文件, 目标路径) 映射列表。"""
         if source_path.is_dir():
             return self._walk_source_dir(source_path, dest_root)
 
-        if _is_zip_archive(source_path) or _is_tar_archive(source_path):
-            _safe_extract_archive(source_path, temp_dir)
+        if is_supported_archive(source_path):
+            extract_archive(
+                source_path,
+                temp_dir,
+                password=password,
+                password_candidates=password_candidates,
+            )
             effective_root = temp_dir
             if strip_single_top_dir:
                 entries = list(temp_dir.iterdir())
@@ -365,6 +366,9 @@ def apply_patch(
     backup: bool = True,
     expected_sha256: Optional[str] = None,
     strip_single_top_dir: bool = True,
+    password: Optional[str] = None,
+    password_candidates: Optional[Sequence[str]] = None,
+    progress_callback: Optional[ProgressCallback] = None,
     steam_root: Optional[Union[str, Path]] = None,
 ) -> PatchResult:
     """一键安装 Galgame 补丁的便捷函数。"""
@@ -380,6 +384,9 @@ def apply_patch(
         backup=backup,
         expected_sha256=expected_sha256,
         strip_single_top_dir=strip_single_top_dir,
+        password=password,
+        password_candidates=password_candidates,
+        progress_callback=progress_callback,
     )
 
 

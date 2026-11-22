@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
+  build-python:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -25,13 +25,64 @@ jobs:
           PYTHONPATH: src
         run: python -m unittest discover -s tests -v
 
-      - name: Build distribution packages
+      - name: Build wheel and sdist
         run: |
           python -m pip install --upgrade pip build
           python -m build
 
+      - name: Upload Python packages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip pyinstaller py7zr pyzipper
+
+      - name: Run unit tests
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+
+      - name: Build standalone Windows executable
+        run: python scripts/build_exe.py
+
+      - name: Upload Windows executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/galgame-patcher-windows-x64.exe
+
+  publish-release:
+    needs: [build-python, build-windows-exe]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Python packages
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: release-assets
+
+      - name: Download Windows executable
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: release-assets
+
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: release-assets/*
           generate_release_notes: true
