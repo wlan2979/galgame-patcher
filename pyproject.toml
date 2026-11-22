@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "galgame-patcher"
+version = "0.1.0"
+description = "一键定位并给对应 Galgame 自动打补丁的 Python 库与命令行工具"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "wlan2979", email = "wlan29793@gmail.com" },
+]
+keywords = ["galgame", "visual-novel", "patcher", "steam", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/wlan2979/galgame-patcher"
+Repository = "https://github.com/wlan2979/galgame-patcher"
+Issues = "https://github.com/wlan2979/galgame-patcher/issues"
+
+[project.scripts]
+galgame-patcher = "galgame_patcher.cli:main"
+galpatch = "galgame_patcher.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
