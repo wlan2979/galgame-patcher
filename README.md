@@ -2,6 +2,9 @@
 
 一个零第三方强制依赖的轻量级 Python 库与桌面可视化工具，用于**自动扫描本机 Galgame、在线下载补丁、支持 `.zip` / `.7z` / `.rar` / 密码解压并一键安装或还原游戏补丁**。
 
+> [!NOTE]
+> 库与命令行只依赖 Python 标准库。桌面 GUI 额外需要 `tkinter`：Windows / macOS 官方安装包已自带；Debian/Ubuntu 需执行 `sudo apt install python3-tk`。缺少 tkinter 时仅 GUI 不可用，库与 CLI 照常工作。
+
 ## 核心特性 (v0.2.0)
 
 - **自动扫描本机 Galgame & 在线下载补丁**：

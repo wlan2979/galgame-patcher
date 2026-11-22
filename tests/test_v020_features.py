@@ -6,6 +6,7 @@ import functools
 import http.server
 import io
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -324,22 +325,58 @@ class TestV020Features(unittest.TestCase):
             server.server_close()
 
     def test_gui_module_importable_and_instantiable(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError:
+            self.skipTest("当前 Python 未包含 tkinter，跳过 GUI 测试")
+
         from galgame_patcher import gui
 
         self.assertTrue(callable(gui.launch_gui))
         try:
-            import tkinter as tk
-
             root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(f"无图形显示环境，跳过 Tk 窗口测试: {exc}")
+        try:
             root.withdraw()
             app = gui.GalgamePatcherGUI(root)
             self.assertIsNotNone(app.tree)
+        finally:
             root.destroy()
-        except Exception as exc:
-            # 无图形显示环境的 Linux CI 容器上允许跳过窗口实例化
-            if sys.platform.startswith("linux"):
-                self.skipTest(f"无图形显示环境，跳过 Tk 窗口测试: {exc}")
-            raise
+
+    def test_package_and_cli_work_without_tkinter(self) -> None:
+        """回归测试：屏蔽 tkinter 后，import 包与 CLI 均不应失败。"""
+        src_dir = Path(__file__).resolve().parent.parent / "src"
+        code = (
+            "import sys\n"
+            "sys.modules['tkinter'] = None\n"
+            "sys.modules['_tkinter'] = None\n"
+            "import galgame_patcher\n"
+            "from galgame_patcher.cli import main\n"
+            "assert 'galgame_patcher.gui' not in sys.modules\n"
+            "assert main(['hash', sys.argv[1]]) == 0\n"
+            "assert main(['gui']) == 1\n"
+            "try:\n"
+            "    galgame_patcher.launch_gui()\n"
+            "except ImportError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise AssertionError('launch_gui should raise ImportError')\n"
+        )
+        sample = self.root / "sample.bin"
+        sample.write_bytes(b"data")
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(src_dir)
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.run(
+            [sys.executable, "-c", code, str(sample)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("python3-tk", proc.stderr)
 
 
 if __name__ == "__main__":

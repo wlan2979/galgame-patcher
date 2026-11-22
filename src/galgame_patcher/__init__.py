@@ -5,7 +5,6 @@ from __future__ import annotations
 from .archive import extract_archive, is_supported_archive
 from .catalog import PatchCatalog
 from .downloader import download_patch
-from .gui import launch_gui
 from .locator import SteamLocator, locate_game
 from .models import (
     COMMON_ARCHIVE_EXTENSIONS,
@@ -19,6 +18,13 @@ from .models import (
 from .patcher import GalgamePatcher, apply_patch, compute_sha256, rollback_patch
 
 __version__ = "0.2.0"
+
+
+def launch_gui() -> int:
+    """启动桌面 GUI（惰性导入 tkinter，缺失时不影响库与 CLI 的其余功能）。"""
+    from .gui import launch_gui as _launch_gui
+
+    return _launch_gui()
 
 __all__ = [
     "__version__",

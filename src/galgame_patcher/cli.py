@@ -110,7 +110,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         if args.command == "gui":
-            from .gui import launch_gui
+            try:
+                from .gui import launch_gui
+            except ModuleNotFoundError as exc:
+                if exc.name and exc.name.split(".")[0] in ("tkinter", "_tkinter"):
+                    print(
+                        "错误: 当前 Python 未包含 tkinter，无法启动 GUI。\n"
+                        "  Debian/Ubuntu: sudo apt install python3-tk\n"
+                        "  其他情况请改用带 Tk 支持的 Python，或直接使用 Release 中的 .exe。\n"
+                        "  命令行功能 (apply/scan/auto/locate/rollback/hash) 不受影响。",
+                        file=sys.stderr,
+                    )
+                    return 1
+                raise
 
             return launch_gui()
 
