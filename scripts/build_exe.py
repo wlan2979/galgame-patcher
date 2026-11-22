@@ -47,7 +47,7 @@ def main() -> int:
 
     subprocess.run(command, cwd=project_root, check=True)
     exe_path = project_root / "dist" / "galgame-patcher-windows-x64.exe"
-    print(f"打包完成: {exe_path}")
+    print(f"Build succeeded: {exe_path}")
     return 0
 
 
