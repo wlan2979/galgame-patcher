@@ -1,4 +1,4 @@
-"""v0.2.0 新增功能测试：加密归档、密码自动尝试、.7z、在线下载、清单扫描、CLI 与 GUI。"""
+"""v0.2.x 功能测试：加密归档、用户指定密码、.7z、在线下载、清单扫描、CLI 与 GUI。"""
 
 from __future__ import annotations
 
@@ -136,19 +136,19 @@ class TestV020Features(unittest.TestCase):
         self.root = Path(self._tmp.name)
 
         self.steam_root = self.root / "Steam"
-        self.game_dir = self.steam_root / "steamapps" / "common" / "SenrenBanka"
+        self.game_dir = self.steam_root / "steamapps" / "common" / "SampleVN"
         self.game_dir.mkdir(parents=True)
-        (self.game_dir / "SenrenBanka.exe").write_bytes(b"ORIG_EXE")
+        (self.game_dir / "SampleVN.exe").write_bytes(b"ORIG_EXE")
         (self.game_dir / "patch.xp3").write_bytes(b"ORIG_XP3")
 
         acf_content = '''
 "AppState"
 {
-    "appid"        "1144400"
-    "installdir"   "SenrenBanka"
+    "appid"        "700001"
+    "installdir"   "SampleVN"
 }
 '''
-        (self.steam_root / "steamapps" / "appmanifest_1144400.acf").write_text(
+        (self.steam_root / "steamapps" / "appmanifest_700001.acf").write_text(
             acf_content, encoding="utf-8"
         )
 
@@ -158,13 +158,15 @@ class TestV020Features(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_password_list_ordering_and_encrypted_zip_auto_password(self) -> None:
-        candidates = build_password_list(password="custom_pw", password_candidates=["extra"])
-        self.assertEqual(candidates[0], "custom_pw")
-        self.assertIn("galgame", candidates)
-        self.assertIn("extra", candidates)
+    def test_password_list_has_no_builtin_dictionary(self) -> None:
+        # 只包含调用方明确提供的密码，不内置任何密码字典
+        self.assertEqual(build_password_list(), [None])
+        self.assertEqual(
+            build_password_list(password="custom_pw", password_candidates=["extra"]),
+            ["custom_pw", None, "extra"],
+        )
 
-        # 使用内置常见密码 "galgame" 加密，不显式传入密码时应能自动轮询解出
+    def test_encrypted_zip_requires_user_supplied_password(self) -> None:
         enc_zip = self.root / "encrypted_patch.zip"
         _build_encrypted_zip(
             enc_zip,
@@ -173,11 +175,17 @@ class TestV020Features(unittest.TestCase):
             password="galgame",
         )
 
-        res = self.patcher.apply(enc_zip, game_dir=self.game_dir)
+        # 不提供密码时不再自动猜测，即使是以前内置字典里的密码也应失败
+        with self.assertRaises(ValueError):
+            self.patcher.apply(enc_zip, game_dir=self.game_dir)
+        self.assertEqual((self.game_dir / "patch.xp3").read_bytes(), b"ORIG_XP3")
+
+        # 显式传入 password 可解压
+        res = self.patcher.apply(enc_zip, game_dir=self.game_dir, password="galgame")
         self.assertTrue(res.success)
         self.assertEqual((self.game_dir / "patch.xp3").read_bytes(), b"DECRYPTED_XP3_CONTENT")
 
-        # 使用非常见密码加密时，显式传入正确密码可通过，不传应报错
+        # 通过 password_candidates（对应 CLI --try-password）提供候选密码也可解压
         custom_zip = self.root / "secret_patch.zip"
         _build_encrypted_zip(
             custom_zip,
@@ -185,17 +193,22 @@ class TestV020Features(unittest.TestCase):
             b"SECRET_VOICE",
             password="my_unique_secret_999",
         )
-
         with self.assertRaises(ValueError):
-            extract_archive(custom_zip, self.root / "out_fail")
+            extract_archive(custom_zip, self.root / "out_fail", password="wrong")
 
         res2 = self.patcher.apply(
             custom_zip,
             game_dir=self.game_dir,
-            password="my_unique_secret_999",
+            password_candidates=["wrong", "my_unique_secret_999"],
         )
         self.assertTrue(res2.success)
         self.assertEqual((self.game_dir / "voice.xp3").read_bytes(), b"SECRET_VOICE")
+
+    def test_default_catalog_contains_no_real_titles_or_links(self) -> None:
+        catalog = PatchCatalog.default()
+        self.assertEqual([e.id for e in catalog.entries], ["example_game"])
+        self.assertTrue(all(not e.patch_url for e in catalog.entries))
+        self.assertTrue(all(e.steam_app_id is None for e in catalog.entries))
 
     def test_7z_archive_patch_if_bsdtar_or_7z_available(self) -> None:
         # Windows 11/Server 内置 bsdtar 支持生成与解压 .7z
@@ -228,9 +241,9 @@ class TestV020Features(unittest.TestCase):
         web_dir = self.root / "web"
         web_dir.mkdir()
 
-        patch_zip = web_dir / "senren_chs_v2.zip"
+        patch_zip = web_dir / "sample_patch_v2.zip"
         with zipfile.ZipFile(patch_zip, "w") as zf:
-            zf.writestr("SenrenPatch/patch.xp3", b"ONLINE_PATCH_V2")
+            zf.writestr("SamplePatch/patch.xp3", b"ONLINE_PATCH_V2")
 
         patch_sha = compute_sha256(patch_zip)
         catalog_path = web_dir / "catalog.json"
@@ -238,11 +251,11 @@ class TestV020Features(unittest.TestCase):
             "version": 1,
             "games": [
                 {
-                    "id": "senren_banka",
-                    "name": "千恋＊万花",
-                    "steam_app_id": 1144400,
-                    "install_dir_name": "SenrenBanka",
-                    "executable_name": "SenrenBanka.exe",
+                    "id": "sample_vn",
+                    "name": "示例视觉小说",
+                    "steam_app_id": 700001,
+                    "install_dir_name": "SampleVN",
+                    "executable_name": "SampleVN.exe",
                     "patch_url": "",
                     "patch_version": "2.0",
                     "expected_sha256": patch_sha,
@@ -264,14 +277,14 @@ class TestV020Features(unittest.TestCase):
 
         try:
             base_url = f"http://127.0.0.1:{port}"
-            catalog_data["games"][0]["patch_url"] = f"{base_url}/senren_chs_v2.zip"
+            catalog_data["games"][0]["patch_url"] = f"{base_url}/sample_patch_v2.zip"
             catalog_path.write_text(json.dumps(catalog_data), encoding="utf-8")
 
             # 1) 从 URL 加载清单并扫描本地游戏
             catalog = PatchCatalog.load(f"{base_url}/catalog.json")
             statuses = catalog.scan_games(locator=self.locator, only_installed=True)
             self.assertEqual(len(statuses), 1)
-            self.assertEqual(statuses[0].entry.id, "senren_banka")
+            self.assertEqual(statuses[0].entry.id, "sample_vn")
             self.assertTrue(statuses[0].installed)
             self.assertFalse(statuses[0].patched)
 
@@ -279,7 +292,7 @@ class TestV020Features(unittest.TestCase):
             progress_events: list[tuple[int, int | None]] = []
             cache_dir = self.root / "dl_cache"
             downloaded = download_patch(
-                f"{base_url}/senren_chs_v2.zip",
+                f"{base_url}/sample_patch_v2.zip",
                 dest_dir=cache_dir,
                 expected_sha256=patch_sha,
                 progress_callback=lambda d, t: progress_events.append((d, t)),
@@ -301,13 +314,13 @@ class TestV020Features(unittest.TestCase):
                     ]
                 )
             self.assertEqual(code_scan, 0)
-            self.assertIn("千恋＊万花", scan_out.getvalue())
+            self.assertIn("示例视觉小说", scan_out.getvalue())
 
             with redirect_stdout(io.StringIO()):
                 code_auto = cli_main(
                     [
                         "auto",
-                        "senren_banka",
+                        "sample_vn",
                         "--catalog",
                         f"{base_url}/catalog.json",
                         "--steam-root",

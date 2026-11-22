@@ -10,6 +10,8 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional, Union
 
+from ._version import __version__
+
 ProgressCallback = Callable[[int, Optional[int]], None]
 
 _CHUNK_SIZE = 64 * 1024
@@ -91,7 +93,7 @@ def download_patch(
 
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "galgame-patcher/0.2.0"},
+        headers={"User-Agent": f"galgame-patcher/{__version__}"},
     )
 
     part_path: Optional[Path] = None

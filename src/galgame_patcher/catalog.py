@@ -7,59 +7,23 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from ._version import __version__
 from .locator import SteamLocator
 from .models import CatalogEntry, InstalledGameStatus
 
+# 内置清单仅提供一个格式示例，不收录任何具体作品或补丁链接。
+# 请通过 PatchCatalog.load(<本地 JSON 路径或 URL>) 加载你自己维护的清单，
+# 且只收录官方发布或已获授权的补丁。
 DEFAULT_CATALOG_ENTRIES: list[dict[str, Any]] = [
     {
-        "id": "senren_banka",
-        "name": "千恋＊万花 (Senren＊Banka)",
-        "steam_app_id": 1144400,
-        "install_dir_name": "SenrenBanka",
-        "executable_name": "SenrenBanka.exe",
+        "id": "example_game",
+        "name": "示例游戏（请导入你自己的清单）",
+        "steam_app_id": None,
+        "install_dir_name": "ExampleGame",
+        "executable_name": "Game.exe",
         "patch_url": "",
         "patch_version": "1.0",
-        "description": "柚子社作品《千恋＊万花》，支持放置官方/汉化补丁链接",
-    },
-    {
-        "id": "sabbat_of_the_witch",
-        "name": "魔女的夜宴 (Sabbat of the Witch)",
-        "steam_app_id": 888790,
-        "install_dir_name": "Sabbat of the Witch",
-        "executable_name": "SabbatOfTheWitch.exe",
-        "patch_url": "",
-        "patch_version": "1.0",
-        "description": "柚子社作品《魔女的夜宴》补丁配置模板",
-    },
-    {
-        "id": "riddle_joker",
-        "name": "RIDDLE JOKER",
-        "steam_app_id": 1277930,
-        "install_dir_name": "RIDDLE JOKER",
-        "executable_name": "RiddleJoker.exe",
-        "patch_url": "",
-        "patch_version": "1.0",
-        "description": "柚子社作品《RIDDLE JOKER》补丁配置模板",
-    },
-    {
-        "id": "atri",
-        "name": "ATRI -My Dear Moments-",
-        "steam_app_id": 1230140,
-        "install_dir_name": "ATRI -My Dear Moments-",
-        "executable_name": "ATRI.exe",
-        "patch_url": "",
-        "patch_version": "1.0",
-        "description": "Frontwing / Aniplex.exe 作品《ATRI》补丁配置模板",
-    },
-    {
-        "id": "summer_pockets_rb",
-        "name": "Summer Pockets REFLECTION BLUE",
-        "steam_app_id": 2417660,
-        "install_dir_name": "Summer Pockets REFLECTION BLUE",
-        "executable_name": "SiglusEngine.exe",
-        "patch_url": "",
-        "patch_version": "1.0",
-        "description": "Key 社作品《Summer Pockets REFLECTION BLUE》补丁配置模板",
+        "description": "格式示例条目。请只填写官方发布或已获授权的补丁链接。",
     },
 ]
 
@@ -104,7 +68,7 @@ class PatchCatalog:
         """从远程 HTTP/HTTPS/FILE URL 加载清单 JSON。"""
         request = urllib.request.Request(
             url,
-            headers={"User-Agent": "galgame-patcher/0.2.0"},
+            headers={"User-Agent": f"galgame-patcher/{__version__}"},
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw_text = response.read().decode("utf-8")

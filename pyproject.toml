@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "galgame-patcher"
-version = "0.2.0"
+dynamic = ["version"]
 description = "一键定位并给对应 Galgame 自动打补丁的 Python 库与桌面工具"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -51,3 +51,6 @@ galgame-patcher-gui = "galgame_patcher.gui:launch_gui"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "galgame_patcher._version.__version__" }

@@ -5,18 +5,25 @@
 > [!NOTE]
 > 库与命令行只依赖 Python 标准库。桌面 GUI 额外需要 `tkinter`：Windows / macOS 官方安装包已自带；Debian/Ubuntu 需执行 `sudo apt install python3-tk`。缺少 tkinter 时仅 GUI 不可用，库与 CLI 照常工作。
 
-## 核心特性 (v0.2.0)
+> [!IMPORTANT]
+> **使用声明**
+> - 本项目只是一个通用的本地文件安装 / 备份 / 还原工具，**不托管、不提供、不索引任何游戏补丁或游戏资源**，内置清单仅包含一个格式示例条目。
+> - 请只用于**官方发布或已获得权利人授权**的补丁（如官方更新、官方语言包、作者明确允许分发的 Mod）。
+> - 请勿在清单中收录指向盗版资源或未经授权分发内容的链接，本仓库也不接受此类清单或 PR。
+> - 修改游戏文件可能违反部分游戏的用户协议，后果由使用者自行承担。
 
-- **自动扫描本机 Galgame & 在线下载补丁**：
+## 核心特性
+
+- **自动扫描本机 Galgame & 按清单下载补丁**：
   - 读取 Windows 注册表与 Steam `libraryfolders.vdf` / `appmanifest_<appid>.acf`，自动扫描本机所有硬盘 Steam 库中已安装的游戏及补丁状态。
-  - 支持加载自定义本地/远程 JSON 补丁源清单（`PatchCatalog`），一键从 URL 流式下载补丁、自动本地缓存复用并校验 SHA256。
+  - 支持加载你自己维护的本地/远程 JSON 补丁源清单（`PatchCatalog`），从 URL 流式下载补丁、本地缓存复用并校验 SHA256。
 - **桌面图形界面 (GUI) & 单文件 `.exe`**：
   - 内置基于标准库 `tkinter` 的桌面窗口（执行 `galpatch gui` 或直接双击 Release 中提供的 `galgame-patcher-windows-x64.exe`）。
   - 无需安装 Python 或命令行操作，点选扫描到的游戏即可一键打补丁或还原备份。
-- **全格式与密码自动尝试解压**：
+- **多格式解压**：
   - 支持单文件补丁（`.xp3`、`.arc`、`.pck`、`.pac`、`.ypf`、`.rpa` 等）、补丁文件夹以及 `.zip`、`.7z`、`.rar`、`.tar` / `.tar.gz` / `.tgz` / `.tar.bz2` / `.tar.xz` 压缩包。
   - 自动剥离单层顶层套壳目录，内置 Zip Slip 路径穿越防护。
-  - 支持显式传入解压密码，或未指定时自动轮询尝试常见 Galgame 补丁解压密码（如 `galgame`、`patch`、`chs`、`123456` 等）。
+  - 加密压缩包需由用户提供密码（`--password` / `--try-password` / GUI 输入框 / 清单 `archive_password`），**程序不内置任何密码字典，也不会自动猜测密码**。
 - **安全备份与一键回滚**：
   - 打补丁前自动将即将被覆盖的原文件备份至 `<游戏目录>/.galpatch_backup/` 并记录新增文件清单，支持随时一键还原至未打补丁前的纯净状态。
 
@@ -64,22 +71,22 @@ galgame-patcher-gui
 galpatch scan --only-installed
 
 # 2) 使用自定义清单自动定位游戏、下载并安装补丁
-galpatch auto senren_banka --catalog ./my_catalog.json
+galpatch auto my_game --catalog ./my_catalog.json
 
-# 3) 直接传入远程 URL 或加密 .7z / .zip 安装补丁（支持自动尝试常见密码）
-galpatch apply https://example.com/patch.7z --app-id 1144400 --password galgame
+# 3) 直接传入远程 URL 或加密 .7z / .zip 安装补丁（加密包需提供密码）
+galpatch apply https://example.com/official_update.7z --app-id 123456 --password <密码>
 
-# 4) 安装本地补丁并附带额外候选密码
-galpatch apply ./patch.zip --game-name "MyGalgame" --try-password mypass
+# 4) 不确定是哪个密码时，可多次传入候选密码（仅尝试你提供的这些）
+galpatch apply ./patch.zip --game-name "MyGame" --try-password pw1 --try-password pw2
 
 # 5) 仅查找并打印游戏安装路径
-galpatch locate --app-id 1144400
+galpatch locate --app-id 123456
 
 # 6) 计算补丁文件的 SHA256 值
 galpatch hash ./patch.zip
 
 # 7) 一键卸载补丁并恢复游戏目录
-galpatch rollback "D:\SteamLibrary\steamapps\common\MyGalgame"
+galpatch rollback "D:\SteamLibrary\steamapps\common\MyGame"
 ```
 
 ### 3. Python 库用法
@@ -87,21 +94,21 @@ galpatch rollback "D:\SteamLibrary\steamapps\common\MyGalgame"
 ```python
 from galgame_patcher import GalgamePatcher, PatchCatalog, apply_patch, rollback_patch
 
-# 1) 使用清单自动扫描本机已安装的 Galgame
-catalog = PatchCatalog.load("./my_catalog.json")  # 或不传参数使用内置清单模板
+# 1) 使用清单自动扫描本机已安装的游戏
+catalog = PatchCatalog.load("./my_catalog.json")
 for status in catalog.scan_games(only_installed=True):
-    print(status.entry.name, status.game_dir, "已打补丁:" if status.patched else "未打补丁")
+    print(status.entry.name, status.game_dir, "已打补丁" if status.patched else "未打补丁")
 
 # 2) 按清单条目自动下载、校验并打补丁
 patcher = GalgamePatcher()
-result = patcher.apply_from_catalog("senren_banka", catalog=catalog)
+result = patcher.apply_from_catalog("my_game", catalog=catalog)
 print(result.message)
 
 # 3) 直接传入本地加密压缩包或远程 URL 打补丁
 result = apply_patch(
-    patch_source="./sample_patch.7z",
-    app_id=1144400,
-    password="custom_password",  # 不传时也会自动尝试常见密码
+    patch_source="./official_update.7z",
+    app_id=123456,
+    password="<密码>",  # 加密包必须提供；未加密可省略
 )
 
 # 4) 如需卸载补丁并还原原文件：
@@ -111,22 +118,24 @@ print(rollback_result.message)
 
 ### 4. 自定义清单 JSON 格式示例
 
+> 请只收录官方发布或已获授权的补丁链接。
+
 ```json
 {
   "version": 1,
   "games": [
     {
-      "id": "my_galgame",
-      "name": "示例 Galgame",
+      "id": "my_game",
+      "name": "示例游戏",
       "steam_app_id": 123456,
-      "install_dir_name": "MyGalgame",
+      "install_dir_name": "MyGame",
       "executable_name": "Game.exe",
-      "patch_url": "https://example.com/patches/my_galgame_chs.7z",
+      "patch_url": "https://example.com/official/my_game_update_1.2.zip",
       "patch_version": "1.2",
       "expected_sha256": null,
-      "archive_password": "galgame",
+      "archive_password": null,
       "target_subdir": "",
-      "description": "中文汉化补丁 v1.2"
+      "description": "官方更新补丁 v1.2"
     }
   ]
 }

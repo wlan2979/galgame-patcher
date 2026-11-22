@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from .archive import extract_archive, is_supported_archive
+from ._version import __version__
 from .catalog import PatchCatalog
 from .downloader import download_patch
 from .locator import SteamLocator, locate_game
 from .models import (
     COMMON_ARCHIVE_EXTENSIONS,
-    COMMON_ARCHIVE_PASSWORDS,
     COMMON_PATCH_EXTENSIONS,
     CatalogEntry,
     GameProfile,
@@ -16,8 +16,6 @@ from .models import (
     PatchResult,
 )
 from .patcher import GalgamePatcher, apply_patch, compute_sha256, rollback_patch
-
-__version__ = "0.2.0"
 
 
 def launch_gui() -> int:
@@ -30,7 +28,6 @@ __all__ = [
     "__version__",
     "COMMON_PATCH_EXTENSIONS",
     "COMMON_ARCHIVE_EXTENSIONS",
-    "COMMON_ARCHIVE_PASSWORDS",
     "GameProfile",
     "PatchResult",
     "CatalogEntry",

@@ -11,6 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
 
+from ._version import __version__
 from .catalog import PatchCatalog
 from .locator import SteamLocator
 from .models import InstalledGameStatus
@@ -34,7 +35,7 @@ class GalgamePatcherGUI:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Galgame 一键补丁工具 v0.2.0")
+        self.root.title(f"Galgame 一键补丁工具 v{__version__}")
         self.root.geometry("940x660")
         self.root.minsize(820, 560)
 
@@ -144,7 +145,7 @@ class GalgamePatcherGUI:
         options_row.columnconfigure(1, weight=1)
         options_row.columnconfigure(3, weight=1)
 
-        ttk.Label(options_row, text="解压密码 (留空自动尝试):").grid(
+        ttk.Label(options_row, text="解压密码 (可选):").grid(
             row=0, column=0, sticky=tk.W, padx=(0, 6)
         )
         ttk.Entry(options_row, textvariable=self.password_var, width=20).grid(

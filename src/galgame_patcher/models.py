@@ -40,17 +40,6 @@ COMMON_ARCHIVE_EXTENSIONS: tuple[str, ...] = (
     ".tar.xz",
 )
 
-COMMON_ARCHIVE_PASSWORDS: tuple[str, ...] = (
-    "galgame",
-    "patch",
-    "chs",
-    "123456",
-    "acg",
-    "hikari",
-    "sakura",
-    "nekopara",
-)
-
 
 @dataclass
 class GameProfile:

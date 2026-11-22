@@ -1,4 +1,4 @@
-"""多格式归档解压模块，支持 .zip / .7z / .rar / .tar* 与密码自动尝试。"""
+"""多格式归档解压模块，支持 .zip / .7z / .rar / .tar* 及用户指定的解压密码。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Optional, Sequence
 
-from .models import COMMON_ARCHIVE_EXTENSIONS, COMMON_ARCHIVE_PASSWORDS
+from .models import COMMON_ARCHIVE_EXTENSIONS
 
 _TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
 
@@ -58,7 +58,11 @@ def build_password_list(
     password: Optional[str] = None,
     password_candidates: Optional[Sequence[str]] = None,
 ) -> list[Optional[str]]:
-    """构建去重后的压缩包密码尝试顺序列表。"""
+    """构建去重后的压缩包密码尝试顺序列表。
+
+    只包含调用方明确提供的密码（以及 ``None`` 表示无密码），
+    不内置任何密码字典。
+    """
     ordered: list[Optional[str]] = []
     seen: set[Optional[str]] = set()
 
@@ -76,10 +80,6 @@ def build_password_list(
     for candidate in password_candidates or ():
         if candidate:
             _push(candidate)
-
-    for common in COMMON_ARCHIVE_PASSWORDS:
-        if common:
-            _push(common)
 
     return ordered
 
@@ -188,7 +188,10 @@ def _extract_zip_with_zipfile(
 
         passwords_to_try = [pwd for pwd in password_list if pwd is not None]
         if not passwords_to_try:
-            raise ValueError("ZIP 压缩包已加密，但未提供可用解压密码")
+            raise ValueError(
+                "ZIP 压缩包已加密，请提供解压密码"
+                "（命令行 --password，或在 GUI 中填写“解压密码”）"
+            )
 
         last_error: Optional[Exception] = None
         for pwd in passwords_to_try:
