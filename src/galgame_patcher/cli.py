@@ -151,9 +151,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="以 JSON 格式输出搜索结果",
     )
 
-    # sites 子命令（官方/开源补丁站导航与自定义来源配置）
+    # sites 子命令（补丁站点导航与自定义来源配置）
     sites_parser = subparsers.add_parser(
-        "sites", help="列出官方/开源补丁网站快捷入口与自定义来源配置文件路径"
+        "sites", help="列出发行商、社区补丁站点和自定义来源配置文件路径"
     )
     sites_parser.add_argument(
         "--open",
@@ -174,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="检查本地补丁文件大小、修改时间、类型与 SHA256（安装前核对）",
     )
     verify_file_parser.add_argument("path", help="待检查的本地补丁文件路径")
+    verify_file_parser.add_argument("--sha256", help="从可信发布页取得的预期 SHA256")
 
     # auto 子命令
     auto_parser = subparsers.add_parser(
@@ -386,6 +387,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "trusted": c.trusted,
                         "trust_reason": c.trust_reason,
                         "bare_executable": c.bare_executable,
+                        "manual_install": c.manual_install,
                         "url": c.url,
                         "title": c.title,
                         "source_site": c.source_site,
@@ -410,21 +412,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"共找到 {len(candidates)} 条补丁候选（本命令只列出链接，不下载任何文件）：\n"
             )
             for idx, cand in enumerate(candidates, start=1):
-                trust_tag = "可信" if cand.trusted else "未审核"
+                trust_tag = "白名单" if cand.trusted else "未审核"
                 kind = "直链包" if cand.is_direct_download else "发布页"
+                if cand.manual_install:
+                    kind = "手动安装"
                 lang = f" [{cand.language}]" if cand.language else ""
                 print(
                     f"{idx}. [{trust_tag}] [{kind} | {cand.source_site}]{lang} {cand.title}"
                 )
                 print(f"   URL: {cand.url}")
+                if cand.description:
+                    print(f"   {cand.description}")
                 print(f"   说明: {cand.trust_reason}")
                 if cand.bare_executable:
                     print("   ⚠ 该链接指向可执行文件，下载后请务必核对哈希再安装")
 
             print(
                 "\n以上链接均来自第三方，本工具不保证其安全性。\n"
-                "请用浏览器自行下载，下载后在工具里用本地文件路径安装，\n"
-                "安装前会显示文件 SHA256 供你核对。"
+                "请在浏览器查阅发行版和安装方式。标为手动安装的补丁请按发布者的说明操作。\n"
+                "使用本工具安装本地补丁前，可用 verify-file --sha256 核对文件。"
             )
             return 0
 
@@ -457,7 +463,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"已在浏览器中打开: {chosen['name']} -> {chosen['url']}")
                 return 0
 
-            print("官方 / 开源补丁网站与公共数据库导航：\n")
+            print("发行商与社区补丁资源导航\n")
             for idx, site in enumerate(portals, start=1):
                 print(f"{idx}. [{site['mode']}] {site['name']}")
                 print(f"   URL: {site['url']}")
@@ -474,6 +480,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(
                     "\n⚠ 警告：该文件是可执行文件，安装后会被游戏直接加载，请确认来源可信！"
                 )
+            if args.sha256 is not None:
+                expected = args.sha256.strip().lower()
+                if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+                    raise ValueError("预期 SHA256 必须为 64 位十六进制值")
+                if inspection.sha256 != expected:
+                    raise ValueError(f"SHA256 不匹配，预期 {expected}")
+                print("SHA256 与预期值一致")
             return 0
 
         if args.command == "auto":

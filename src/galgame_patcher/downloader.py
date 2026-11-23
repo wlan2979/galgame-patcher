@@ -63,13 +63,17 @@ _TRUSTED_GITHUB_OWNERS: tuple[str, ...] = ()
 # GitHub 仓库搜索的最低 star 门槛
 DEFAULT_MIN_GITHUB_STARS = 10
 
-# 官方与开源补丁网站快捷导航（用于 CLI sites 与 GUI 官方站导航窗口）
+_NEKONYAN_PATCH_PAGE = "https://patches.nekonyansoft.com/"
+_NEKONYAN_TITLE_TOKEN_RE = re.compile(r"[^\W\d_]+|\d+")
+_SENREN_DOWNLOAD_PAGE = "https://www.yuzu-soft.com/products/senren/download.html"
+
+# 发行商与社区资源导航，供 CLI 和 GUI 共用。
 OFFICIAL_PATCH_PORTALS: tuple[dict[str, str], ...] = (
     {
         "name": "VNDB（视觉小说补丁数据库）",
         "url": "https://vndb.org/r",
         "mode": "内置API搜索",
-        "desc": "涵盖大多数作品的官方补丁与社区补丁发布索引",
+        "desc": "社区维护的发行版本数据库，可查找补丁候选",
     },
     {
         "name": "柚子社 Yuzusoft 官方支持页",
@@ -79,33 +83,33 @@ OFFICIAL_PATCH_PORTALS: tuple[dict[str, str], ...] = (
     },
     {
         "name": "NekoNyan 官方补丁站",
-        "url": "https://nekonyansoft.com/shop/patches",
+        "url": _NEKONYAN_PATCH_PAGE,
         "mode": "内置搜索/导航",
-        "desc": "NekoNyan 发行作品的官方 18+ / 恢复补丁下载页",
+        "desc": "发行商提供的 Steam 恢复补丁和部分商店版更新",
     },
     {
         "name": "PCGamingWiki（修复与补丁百科）",
         "url": "https://www.pcgamingwiki.com/",
         "mode": "内置API搜索",
-        "desc": "PC 游戏与视觉小说官方更新、兼容性修复指引",
+        "desc": "社区维护的 PC 游戏兼容性与修复资料",
     },
     {
-        "name": "07th-Mod（寒蝉/海猫开源语音补丁）",
+        "name": "07th-Mod（寒蝉/海猫社区 Mod）",
         "url": "https://07th-mod.com/",
         "mode": "内置搜索/导航",
-        "desc": "07th Expansion 作品的高清立绘与全语音开源补丁项目",
+        "desc": "社区 Mod 的安装指南与发布页",
     },
     {
         "name": "Shiravune（白舟）官方网站",
-        "url": "https://www.shiravune.com/",
+        "url": "https://shiravune.com/",
         "mode": "浏览器打开",
-        "desc": "Shiravune 发行作品官方补丁页（站内 Patches 栏目）",
+        "desc": "发行商官网，可按作品查找公告",
     },
     {
-        "name": "Kagura Games 官方站",
-        "url": "https://www.kaguragames.com/",
+        "name": "Kagura Games 补丁目录",
+        "url": "https://www.kaguragames.com/patch/",
         "mode": "浏览器打开",
-        "desc": "Kagura Games 官方免费补丁页面（站内 Patches 栏目）",
+        "desc": "发行商补丁目录，适用版本及费用见各条目",
     },
     {
         "name": "Denpasoft 官方站",
@@ -132,10 +136,10 @@ OFFICIAL_PATCH_PORTALS: tuple[dict[str, str], ...] = (
         "desc": "MangaGamer 官方支持与正版补丁发布站",
     },
     {
-        "name": "Sekai Project 官方站",
-        "url": "https://sekaiproject.com/",
+        "name": "Sekai Project 支持中心",
+        "url": "https://support.sekaiproject.com/portal/en/kb",
         "mode": "浏览器打开",
-        "desc": "Sekai Project 官方补丁公告与支持站",
+        "desc": "发行商知识库与支持入口",
     },
 )
 
@@ -233,10 +237,13 @@ def _get_url_path_lower(url: str) -> str:
     return urllib.parse.unquote(parsed.path).lower()
 
 
+def _has_executable_suffix(name: str) -> bool:
+    return name.lower().rstrip(" .").endswith(_BARE_EXECUTABLE_SUFFIXES)
+
+
 def is_executable_url(url: str) -> bool:
     """判断 URL 路径是否以裸可执行文件/脚本后缀结尾。"""
-    path_lower = _get_url_path_lower(url)
-    return any(path_lower.endswith(ext) for ext in _BARE_EXECUTABLE_SUFFIXES)
+    return _has_executable_suffix(_get_url_path_lower(url))
 
 
 def is_direct_patch_url(url: str) -> bool:
@@ -398,6 +405,28 @@ class _AnchorExtractor(html.parser.HTMLParser):
             self._text_parts = []
 
 
+def _is_senren_installer_archive(url: str) -> bool:
+    target = urllib.parse.urlparse(url)
+    return (
+        target.hostname in {"yuzu-soft.jp", "www.yuzu-soft.jp"}
+        and target.path == "/bin/sen_patch_1_12.zip"
+    )
+
+
+def _senren_installer_candidate() -> OnlinePatchCandidate:
+    return OnlinePatchCandidate(
+        title="千恋＊万花 v1.12 修正补丁",
+        url=_SENREN_DOWNLOAD_PAGE,
+        source_site="Yuzusoft",
+        version="1.12",
+        official=True,
+        description="解压后按柚子社说明运行发行商安装器。Steam 版兼容性未确认。",
+        trusted=True,
+        trust_reason="柚子社官方修正补丁说明页",
+        manual_install=True,
+    )
+
+
 def scrape_patch_links_from_page(
     page_url: str,
     *,
@@ -406,9 +435,18 @@ def scrape_patch_links_from_page(
     proxies: Optional[dict[str, str]] = None,
 ) -> list[OnlinePatchCandidate]:
     """从任意网页爬取补丁下载链接（自动提取 .zip/.7z/.rar/.xp3/.pck 等直链）。"""
+    if _is_senren_installer_archive(page_url):
+        return [_senren_installer_candidate()]
+
     html_text = fetch_text(page_url, timeout=timeout, proxies=proxies)
     parser = _AnchorExtractor()
     parser.feed(html_text)
+
+    page = urllib.parse.urlparse(page_url)
+    senren_page = page.hostname in {"yuzu-soft.com", "www.yuzu-soft.com"} and page.path in {
+        "/products/senren/download.html",
+        "/products/senren/senren_sup.html",
+    }
 
     keyword_lower = keyword.strip().lower()
     results: list[OnlinePatchCandidate] = []
@@ -416,11 +454,17 @@ def scrape_patch_links_from_page(
 
     for raw_href, label in parser.links:
         full_url = urllib.parse.urljoin(page_url, raw_href)
+        if _is_senren_installer_archive(full_url):
+            if _SENREN_DOWNLOAD_PAGE not in seen_urls:
+                seen_urls.add(_SENREN_DOWNLOAD_PAGE)
+                results.append(_senren_installer_candidate())
+            continue
         if full_url in seen_urls:
             continue
         direct = is_direct_patch_url(full_url)
         combined_text = f"{label} {full_url}".lower()
-        if not direct and "patch" not in combined_text and "补丁" not in combined_text:
+        mentions_patch = any(term in combined_text for term in ("patch", "补丁", "パッチ"))
+        if not mentions_patch and (senren_page or not direct):
             continue
         if keyword_lower and keyword_lower not in combined_text and not direct:
             continue
@@ -437,7 +481,7 @@ def scrape_patch_links_from_page(
                 description=f"从页面 {page_url} 提取",
                 trusted=domain_trusted,
                 trust_reason=(
-                    "命中官方发行商域名白名单"
+                    "链接域名命中来源白名单"
                     if domain_trusted
                     else "从网页提取，发布者未知"
                 ),
@@ -700,6 +744,11 @@ def crawl_yuzusoft_patches(
 
         if is_direct_patch_url(full_url):
             if is_broad or any(tok in combined for tok in tokens):
+                if _is_senren_installer_archive(full_url):
+                    if _SENREN_DOWNLOAD_PAGE not in seen_urls:
+                        seen_urls.add(_SENREN_DOWNLOAD_PAGE)
+                        candidates.append(_senren_installer_candidate())
+                    continue
                 if full_url not in seen_urls:
                     seen_urls.add(full_url)
                     domain_ok = _is_trusted_domain(full_url)
@@ -759,7 +808,10 @@ def crawl_yuzusoft_patches(
             )
             for item in sub_items:
                 if item.url not in seen_urls and (
-                    item.is_direct_download or "patch" in item.title.lower() or "パッチ" in item.title
+                    item.manual_install
+                    or item.is_direct_download
+                    or "patch" in item.title.lower()
+                    or "パッチ" in item.title
                 ):
                     seen_urls.add(item.url)
                     item.source_site = "Yuzusoft"
@@ -777,15 +829,14 @@ def crawl_nekonyan_patches(
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
 ) -> list[OnlinePatchCandidate]:
-    """从 NekoNyan 官方补丁汇总页 (nekonyansoft.com/shop/patches) 检索对应作品补丁入口。"""
-    base_page = "https://nekonyansoft.com/shop/patches"
-    html_text = fetch_text(base_page, timeout=timeout, proxies=proxies)
+    """从 NekoNyan 补丁站检索对应作品的发行版入口。"""
+    html_text = fetch_text(_NEKONYAN_PATCH_PAGE, timeout=timeout, proxies=proxies)
     parser = _AnchorExtractor()
     parser.feed(html_text)
 
-    query_lower = game_query.strip().lower()
-    tokens = [t for t in _tokenize_query(game_query) if len(t) >= 2]
-    is_broad = "nekonyan" in query_lower
+    tokens = set(_NEKONYAN_TITLE_TOKEN_RE.findall(game_query.lower()))
+    is_broad = tokens == {"nekonyan"}
+    tokens.discard("nekonyan")
 
     candidates: list[OnlinePatchCandidate] = []
     seen_urls: set[str] = set()
@@ -794,12 +845,11 @@ def crawl_nekonyan_patches(
         if not raw_href.startswith("#") or len(raw_href) <= 1:
             continue
         title = label or raw_href[1:]
-        haystack = f"{title} {raw_href}".lower()
-        if not is_broad:
-            if not tokens or not any(tok in haystack for tok in tokens):
-                continue
+        title_tokens = set(_NEKONYAN_TITLE_TOKEN_RE.findall(f"{title} {raw_href[1:]}".lower()))
+        if not is_broad and (not tokens or not tokens.issubset(title_tokens)):
+            continue
 
-        full_url = f"{base_page}{raw_href}"
+        full_url = f"{_NEKONYAN_PATCH_PAGE}{raw_href}"
         if full_url in seen_urls:
             continue
         seen_urls.add(full_url)
@@ -810,7 +860,11 @@ def crawl_nekonyan_patches(
                 source_site="NekoNyan",
                 is_direct_download=False,
                 official=True,
-                description="NekoNyan 官方补丁页面（点击在浏览器直达该游戏下载卡片）",
+                description=(
+                    "适用发行版为 Steam。补丁用途和安装方式见发行商页面。"
+                    if "steam" in title_tokens
+                    else "适用发行版和安装方式见发行商页面。"
+                ),
                 trusted=True,
                 trust_reason="NekoNyan 官方补丁页（域名命中发行商白名单）",
                 bare_executable=False,
@@ -860,7 +914,7 @@ def crawl_pcgamingwiki_patches(
                 source_site="PCGamingWiki",
                 is_direct_download=False,
                 official=False,
-                description="PCGamingWiki 百科词条（含官方补丁/兼容性修复说明与外链）",
+                description="社区百科词条，可能包含游戏兼容性说明和补丁链接",
                 trusted=_is_trusted_domain(url_str),
                 trust_reason="PCGamingWiki 公开百科页面（域名命中白名单）",
                 bare_executable=False,
@@ -875,21 +929,20 @@ def crawl_07th_mod_patches(
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
 ) -> list[OnlinePatchCandidate]:
-    """针对寒蝉/海猫等 07th 作品检索 07th-Mod 官方与 GitHub 开源补丁仓库。"""
+    """针对寒蝉/海猫等作品检索 07th-Mod 社区项目与 GitHub 仓库。"""
     query_lower = game_query.strip().lower()
     if not any(kw in query_lower for kw in _07TH_KEYWORDS):
         return []
 
     candidates: list[OnlinePatchCandidate] = [
         OnlinePatchCandidate(
-            title="07th-Mod 官方补丁站 (寒蝉/海猫语音与立绘增强)",
+            title="07th-Mod 社区 Mod（寒蝉/海猫）",
             url="https://07th-mod.com/",
             source_site="07th-Mod",
             is_direct_download=False,
-            official=True,
-            description="07th-Mod 官方网站与安装向导",
+            description="社区项目的安装指南。各游戏版本及素材条款见项目说明。",
             trusted=_is_trusted_domain("https://07th-mod.com/"),
-            trust_reason="07th-Mod 官方网站（域名命中白名单）",
+            trust_reason="07th-Mod 项目站点（域名命中白名单）",
             bare_executable=False,
         )
     ]
@@ -901,7 +954,7 @@ def crawl_07th_mod_patches(
     trust_reason = (
         "owner 在本地可信白名单内"
         if owner_trusted
-        else "07th-Mod GitHub 开源仓库，默认未加入个人 owner 白名单"
+        else "07th-Mod GitHub 项目仓库，默认未加入个人 owner 白名单"
     )
 
     try:
@@ -929,7 +982,7 @@ def crawl_07th_mod_patches(
                             url=html_url,
                             source_site="07th-Mod (GitHub)",
                             is_direct_download=False,
-                            description=desc or "07th-Mod 官方开源仓库",
+                            description=desc or "07th-Mod 社区项目仓库",
                             trusted=owner_trusted,
                             trust_reason=trust_reason,
                             bare_executable=False,
@@ -958,6 +1011,8 @@ def discover_patches_online(
 
     def _extend(items: Sequence[OnlinePatchCandidate]) -> None:
         for item in items:
+            if _is_senren_installer_archive(item.url):
+                item = _senren_installer_candidate()
             if item.url not in seen_urls:
                 seen_urls.add(item.url)
                 results.append(item)
@@ -1057,7 +1112,11 @@ def download_patch(
     timeout: float = DEFAULT_TIMEOUT,
     proxies: Optional[dict[str, str]] = None,
 ) -> Path:
-    """从远程 URL 流式下载补丁到本地缓存目录，支持哈希校验与缓存复用。"""
+    """下载补丁到本地缓存，拒绝裸可执行文件，并按需核对 SHA256。"""
+    requested_name = Path(filename).name if filename else ""
+    if is_executable_url(url) or _has_executable_suffix(requested_name):
+        raise ValueError("远程下载不支持裸可执行文件或脚本")
+
     cache_dir = (
         Path(dest_dir)
         if dest_dir is not None
@@ -1070,7 +1129,7 @@ def download_patch(
     )
 
     if filename:
-        initial_target = cache_dir / Path(filename).name
+        initial_target = cache_dir / requested_name
         if initial_target.is_file() and normalized_expected:
             if _compute_file_sha256(initial_target) == normalized_expected:
                 size = initial_target.stat().st_size
@@ -1082,11 +1141,11 @@ def download_patch(
     try:
         with open_url_request(url, timeout=timeout, proxies=proxies) as response:
             headers = response.info()
-            resolved_name = (
-                Path(filename).name
-                if filename
-                else _infer_filename(url, headers.get("Content-Disposition"))
-            )
+            remote_name = _infer_filename(url, headers.get("Content-Disposition"))
+            if is_executable_url(response.geturl()) or _has_executable_suffix(remote_name):
+                raise ValueError("远程下载不支持裸可执行文件或脚本")
+
+            resolved_name = requested_name or remote_name
             target_path = cache_dir / resolved_name
 
             if target_path.is_file() and normalized_expected:

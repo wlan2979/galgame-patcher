@@ -320,7 +320,7 @@ class GalgamePatcherGUI:
 
         self.btn_portals = ttk.Button(
             crawl_row,
-            text="官方补丁站导航...",
+            text="补丁站点导航...",
             command=self.open_portals_dialog,
         )
         self.btn_portals.pack(side=tk.LEFT)
@@ -895,7 +895,7 @@ class GalgamePatcherGUI:
             dialog,
             text=(
                 "搜索结果为第三方链接，本工具不下载也不保证其安全。"
-                "双击可在浏览器打开，请自行下载后使用『选择补丁文件』导入。"
+                "双击查阅来源页面，按对应发行版的说明安装。"
             ),
             fg="#8b0000",
             anchor=tk.W,
@@ -909,7 +909,7 @@ class GalgamePatcherGUI:
 
         cols = ("trusted", "title", "source", "type", "lang", "url")
         tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
-        tree.heading("trusted", text="可信")
+        tree.heading("trusted", text="白名单")
         tree.heading("title", text="标题")
         tree.heading("source", text="来源")
         tree.heading("type", text="类型")
@@ -931,6 +931,8 @@ class GalgamePatcherGUI:
         for idx, cand in enumerate(candidates):
             trust_text = "✔ 白名单" if cand.trusted else "未审核"
             kind_text = "直链包" if cand.is_direct_download else "发布网页"
+            if cand.manual_install:
+                kind_text = "手动安装"
             tree.insert(
                 "",
                 tk.END,
@@ -950,7 +952,13 @@ class GalgamePatcherGUI:
 
         exec_warn_var = tk.StringVar(value="")
         exec_warn_label = tk.Label(
-            dialog, textvariable=exec_warn_var, fg="#c62828", anchor=tk.W, padx=10
+            dialog,
+            textvariable=exec_warn_var,
+            fg="#c62828",
+            anchor=tk.W,
+            padx=10,
+            justify=tk.LEFT,
+            wraplength=880,
         )
         exec_warn_label.pack(fill=tk.X, pady=(0, 8))
 
@@ -963,7 +971,7 @@ class GalgamePatcherGUI:
             if cand.bare_executable:
                 exec_warn_var.set("⚠ 该链接指向可执行文件，请谨慎下载")
             else:
-                exec_warn_var.set(f"可信说明: {cand.trust_reason}")
+                exec_warn_var.set("\n".join(filter(None, (cand.description, cand.trust_reason))))
 
         def _open_browser(_event: object = None) -> None:
             sel = tree.selection()
@@ -992,15 +1000,15 @@ class GalgamePatcherGUI:
         ttk.Button(btn_bar, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT)
 
     def open_portals_dialog(self) -> None:
-        """展示官方/开源补丁站导航窗口及用户自定义站点配置入口。"""
+        """展示发行商和社区资源及自定义站点配置入口。"""
         dialog = tk.Toplevel(self.root)
-        dialog.title("官方与开源补丁网站导航")
+        dialog.title("补丁站点导航")
         dialog.geometry("820x440")
         dialog.transient(self.root)
 
         tip = ttk.Label(
             dialog,
-            text="双击或点击“在浏览器打开”访问官方补丁页面；部分站点受 WAF 保护仅支持在浏览器中手动访问下载。",
+            text="双击或点击“在浏览器打开”查阅发行商或社区的说明。部分站点可能限制自动请求。",
         )
         tip.pack(anchor=tk.W, padx=10, pady=(8, 4))
 

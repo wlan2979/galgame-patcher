@@ -300,3 +300,4 @@ class OnlinePatchCandidate:
     trusted: bool = False
     trust_reason: str = "来源未经审核"
     bare_executable: bool = False
+    manual_install: bool = False
