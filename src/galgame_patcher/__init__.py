@@ -11,6 +11,8 @@ from .downloader import (
     crawl_vndb_patches,
     discover_patches_online,
     download_patch,
+    is_direct_patch_url,
+    is_executable_url,
     scrape_patch_links_from_page,
 )
 from .locator import (
@@ -22,6 +24,7 @@ from .locator import (
     locate_game,
 )
 from .models import (
+    BARE_EXECUTABLE_SUFFIXES,
     COMMON_ARCHIVE_EXTENSIONS,
     COMMON_PATCH_EXTENSIONS,
     GALGAME_ARCHIVE_INDICATORS,
@@ -31,10 +34,18 @@ from .models import (
     GameRunningError,
     InstalledGameStatus,
     OnlinePatchCandidate,
+    PatchFileInspection,
     PatchResult,
+    UntrustedSourceError,
     get_appdata_dir,
 )
-from .patcher import GalgamePatcher, apply_patch, compute_sha256, rollback_patch
+from .patcher import (
+    GalgamePatcher,
+    apply_patch,
+    compute_sha256,
+    inspect_patch_file,
+    rollback_patch,
+)
 
 
 def launch_gui() -> int:
@@ -49,10 +60,13 @@ __all__ = [
     "COMMON_PATCH_EXTENSIONS",
     "GALGAME_ARCHIVE_INDICATORS",
     "COMMON_ARCHIVE_EXTENSIONS",
+    "BARE_EXECUTABLE_SUFFIXES",
     "GameRunningError",
     "ConcurrencyError",
+    "UntrustedSourceError",
     "GameProfile",
     "PatchResult",
+    "PatchFileInspection",
     "CatalogEntry",
     "InstalledGameStatus",
     "OnlinePatchCandidate",
@@ -68,7 +82,10 @@ __all__ = [
     "apply_patch",
     "rollback_patch",
     "compute_sha256",
+    "inspect_patch_file",
     "download_patch",
+    "is_direct_patch_url",
+    "is_executable_url",
     "check_url_head",
     "discover_patches_online",
     "crawl_vndb_patches",

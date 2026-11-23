@@ -57,6 +57,22 @@ COMMON_ARCHIVE_EXTENSIONS: tuple[str, ...] = (
     ".tar.xz",
 )
 
+# 这些格式一旦被复制进游戏目录就会被执行，是恶意软件最直接的载体，
+# 永远不视为可自动下载安装的补丁。
+BARE_EXECUTABLE_SUFFIXES: tuple[str, ...] = (
+    ".exe",
+    ".dll",
+    ".msi",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".vbs",
+    ".js",
+    ".scr",
+    ".com",
+    ".jar",
+)
+
 
 def get_appdata_dir() -> Path:
     """返回 galgame-patcher 的用户配置与日志目录（支持环境变量覆盖以便测试隔离）。"""
@@ -95,6 +111,24 @@ class ConcurrencyError(RuntimeError):
         super().__init__(
             f"另一个 galgame-patcher 实例正在处理该目录（{pid_text}{extra}），请等待其完成"
         )
+
+
+class UntrustedSourceError(RuntimeError):
+    """拒绝从未经审核且未锁定哈希的远程 URL 直接安装补丁时抛出。"""
+
+    def __init__(self, url: str, reason: str = "") -> None:
+        self.url = url
+        self.reason = reason
+        reason_line = f"\n原因: {reason}" if reason else ""
+        message = (
+            f"拒绝从未经审核的远程地址直接安装补丁: {url}{reason_line}\n"
+            "安全风险: 远程补丁可能包含恶意程序，工具无法验证发布者身份。\n"
+            "请任选以下安全方式处理:\n"
+            "  ① 在浏览器中自行下载补丁，再用本地文件路径安装（推荐）\n"
+            "  ② 在清单中为该条目配置 expected_sha256，锁定文件内容后再安装\n"
+            "  ③ 明确知晓风险时，命令行加 --allow-untrusted-url 参数"
+        )
+        super().__init__(message)
 
 
 @dataclass
@@ -219,8 +253,41 @@ class InstalledGameStatus:
 
 
 @dataclass
+class PatchFileInspection:
+    """本地补丁文件核验结果，用于在安装前向用户展示体积、时间与 SHA256 摘要。"""
+
+    path: Path
+    size: int
+    sha256: str
+    modified_at: str
+    is_archive: bool
+    is_bare_executable: bool
+
+    def describe(self) -> str:
+        """输出包含文件类型、大小、修改时间与 SHA256 的多行可读摘要。"""
+        if self.is_bare_executable:
+            kind = "裸可执行文件"
+        elif self.is_archive:
+            kind = "压缩包"
+        else:
+            kind = "补丁文件"
+
+        size_mb = self.size / (1024 * 1024)
+        return (
+            f"文件: {self.path}\n"
+            f"类型: {kind}\n"
+            f"大小: {self.size} 字节 ({size_mb:.2f} MB)\n"
+            f"修改时间: {self.modified_at}\n"
+            f"SHA256: {self.sha256}"
+        )
+
+
+@dataclass
 class OnlinePatchCandidate:
-    """表示从公开补丁网站/数据库爬取到的补丁候选结果。"""
+    """表示从公开补丁网站/数据库爬取到的补丁候选结果。
+
+    安全说明：爬取结果一律只作为「链接」展示，不参与自动下载安装。
+    """
 
     title: str
     url: str
@@ -230,3 +297,6 @@ class OnlinePatchCandidate:
     language: str = ""
     official: bool = False
     description: str = ""
+    trusted: bool = False
+    trust_reason: str = "来源未经审核"
+    bare_executable: bool = False

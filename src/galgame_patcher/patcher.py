@@ -11,6 +11,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,11 +22,14 @@ from .catalog import PatchCatalog
 from .downloader import ProgressCallback, download_patch, is_url
 from .locator import SteamLocator
 from .models import (
+    BARE_EXECUTABLE_SUFFIXES,
     CatalogEntry,
     ConcurrencyError,
     GameProfile,
     GameRunningError,
+    PatchFileInspection,
     PatchResult,
+    UntrustedSourceError,
 )
 
 logger = logging.getLogger("galgame_patcher")
@@ -52,6 +56,24 @@ def _raw_sha256(file_path: Union[str, Path]) -> str:
 def compute_sha256(file_path: Union[str, Path]) -> str:
     """分块计算指定文件的 SHA256 十六进制摘要（小写）。"""
     return _raw_sha256(file_path)
+
+
+def inspect_patch_file(path: Union[str, Path]) -> PatchFileInspection:
+    """检查本地补丁文件的体积、修改时间、类型标记与 SHA256 摘要，供安装前人工核对。"""
+    target = Path(path)
+    if not target.is_file():
+        raise FileNotFoundError(f"补丁文件不存在: {target}")
+
+    st = target.stat()
+    modified_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+    return PatchFileInspection(
+        path=target.resolve(),
+        size=st.st_size,
+        sha256=compute_sha256(target),
+        modified_at=modified_at,
+        is_archive=is_supported_archive(target),
+        is_bare_executable=target.suffix.lower() in BARE_EXECUTABLE_SUFFIXES,
+    )
 
 
 def _is_file_locked(path: Path) -> bool:
@@ -235,9 +257,25 @@ class GalgamePatcher:
         progress_callback: Optional[ProgressCallback] = None,
         force_locked: bool = False,
         dry_run: bool = False,
+        allow_untrusted_url: bool = False,
+        source_origin: str = "manual",
     ) -> PatchResult:
-        """将本地文件/目录/压缩包或远程 URL 补丁一键安装到目标 Galgame 目录。"""
+        """将本地文件/目录/压缩包或受校验的远程 URL 补丁安装到目标 Galgame 目录。"""
         if is_url(patch_source):
+            if expected_sha256 and expected_sha256.strip():
+                pass
+            elif not allow_untrusted_url:
+                raise UntrustedSourceError(
+                    str(patch_source),
+                    "该链接未提供 expected_sha256，工具无法确认下载到的文件是否被篡改",
+                )
+            else:
+                logger.warning(
+                    "用户显式允许从未经审核的远程地址安装 (source_origin=%s): %s",
+                    source_origin,
+                    patch_source,
+                )
+
             source_path = download_patch(
                 str(patch_source),
                 expected_sha256=expected_sha256,
@@ -301,6 +339,7 @@ class GalgamePatcher:
         progress_callback: Optional[ProgressCallback] = None,
         force_locked: bool = False,
         dry_run: bool = False,
+        allow_untrusted_url: bool = False,
     ) -> PatchResult:
         """从补丁源清单中检索游戏条目，自动下载并安装对应补丁。"""
         if isinstance(entry_or_query, CatalogEntry):
@@ -330,6 +369,10 @@ class GalgamePatcher:
             progress_callback=progress_callback,
             force_locked=force_locked,
             dry_run=dry_run,
+            allow_untrusted_url=(
+                entry.expected_sha256 is None and allow_untrusted_url
+            ),
+            source_origin="catalog",
         )
 
     def rollback(self, game_dir: Union[str, Path]) -> PatchResult:
@@ -729,6 +772,8 @@ def apply_patch(
     steam_root: Optional[Union[str, Path]] = None,
     force_locked: bool = False,
     dry_run: bool = False,
+    allow_untrusted_url: bool = False,
+    source_origin: str = "manual",
 ) -> PatchResult:
     """一键安装 Galgame 补丁的便捷函数。"""
     locator = SteamLocator(steam_root=steam_root)
@@ -748,6 +793,8 @@ def apply_patch(
         progress_callback=progress_callback,
         force_locked=force_locked,
         dry_run=dry_run,
+        allow_untrusted_url=allow_untrusted_url,
+        source_origin=source_origin,
     )
 
 

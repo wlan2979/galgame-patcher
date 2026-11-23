@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional
 
 from ._version import __version__
 from .catalog import PatchCatalog, _is_game_patched
-from .downloader import discover_patches_online
+from .downloader import discover_patches_online, is_url
 from .locator import ManualLocator, SteamLocator
 from .models import (
     CatalogEntry,
@@ -28,7 +28,7 @@ from .models import (
     OnlinePatchCandidate,
     get_appdata_dir,
 )
-from .patcher import GalgamePatcher
+from .patcher import GalgamePatcher, inspect_patch_file
 
 logger = logging.getLogger("galgame_patcher")
 
@@ -103,6 +103,8 @@ class GalgamePatcherGUI:
         self._search_after_id: Optional[str] = None
         self._ui_queue: queue.Queue[tuple[Any, ...]] = queue.Queue()
         self._active_thread: Optional[threading.Thread] = None
+        self._confirmed_exec_key: Optional[tuple[str, str]] = None
+        self._inspected_key: Optional[tuple[str, str]] = None
 
         self.search_var = tk.StringVar()
         self.only_installed_var = tk.BooleanVar(value=False)
@@ -284,7 +286,7 @@ class GalgamePatcherGUI:
             row=4, column=2, sticky=tk.W, padx=(6, 0), pady=4
         )
 
-        ttk.Label(right_frame, text="补丁文件 / URL:").grid(
+        ttk.Label(right_frame, text="本地补丁路径:").grid(
             row=5, column=0, sticky=tk.W, pady=4, padx=(0, 8)
         )
         ttk.Entry(right_frame, textvariable=self.patch_source_var).grid(
@@ -299,18 +301,28 @@ class GalgamePatcherGUI:
             patch_btn_box, text="粘贴路径", command=self.paste_patch_path_from_clipboard
         ).pack(side=tk.LEFT)
 
-        # 在线自动爬取补丁按钮行
+        # 在线自动爬取补丁按钮行（只提供浏览器检索与链接复制，不自动下载）
         crawl_row = ttk.Frame(right_frame)
         crawl_row.grid(row=6, column=1, columnspan=2, sticky=tk.W, pady=(2, 6))
         self.btn_crawl = ttk.Button(
             crawl_row,
-            text="自动上网搜索该游戏补丁 (VNDB / GitHub)...",
+            text="自动上网搜索该游戏补丁 (仅提供链接)...",
             command=self.on_search_online_clicked,
         )
         self.btn_crawl.pack(side=tk.LEFT)
 
+        # 本地补丁文件核验预览区（只读，显示体积与 SHA256）
+        ttk.Label(right_frame, text="文件核验预览:").grid(
+            row=7, column=0, sticky=tk.NW, pady=4, padx=(0, 8)
+        )
+        self.inspect_text = tk.Text(
+            right_frame, height=5, state=tk.DISABLED, wrap=tk.WORD, bg="#f5f5f5"
+        )
+        self.inspect_text.grid(row=7, column=1, columnspan=2, sticky=tk.EW, pady=4)
+        self._set_inspect_text("尚未导入本地补丁文件。请先通过“选择补丁文件...”导入并核对 SHA256。")
+
         options_row = ttk.Frame(right_frame)
-        options_row.grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=4)
+        options_row.grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=4)
         options_row.columnconfigure(1, weight=1)
         options_row.columnconfigure(3, weight=1)
 
@@ -330,11 +342,11 @@ class GalgamePatcherGUI:
 
         ttk.Checkbutton(
             right_frame, text="覆盖前自动备份原文件至 .galpatch_backup", variable=self.backup_var
-        ).grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=4)
+        ).grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=4)
 
         # 动作按钮栏
         action_bar = ttk.Frame(right_frame)
-        action_bar.grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=(10, 4))
+        action_bar.grid(row=10, column=0, columnspan=3, sticky=tk.W, pady=(10, 4))
 
         self.btn_dry_run = ttk.Button(
             action_bar, text="仅预览 (Dry-Run)", command=self.on_dry_run_clicked
@@ -358,13 +370,13 @@ class GalgamePatcherGUI:
 
         # 日志文本框（嵌入右侧面板底部）
         ttk.Label(right_frame, text="运行日志:").grid(
-            row=10, column=0, columnspan=3, sticky=tk.W, pady=(8, 2)
+            row=11, column=0, columnspan=3, sticky=tk.W, pady=(8, 2)
         )
         self.log_text = tk.Text(
-            right_frame, height=6, state=tk.DISABLED, wrap=tk.WORD
+            right_frame, height=5, state=tk.DISABLED, wrap=tk.WORD
         )
-        self.log_text.grid(row=11, column=0, columnspan=3, sticky=tk.NSEW, pady=(0, 2))
-        right_frame.rowconfigure(11, weight=1)
+        self.log_text.grid(row=12, column=0, columnspan=3, sticky=tk.NSEW, pady=(0, 2))
+        right_frame.rowconfigure(12, weight=1)
 
         # 底部状态栏与进度条（P3-1 #5 & #8）
         bottom_frame = ttk.Frame(main_frame)
@@ -382,6 +394,50 @@ class GalgamePatcherGUI:
             fg="#1b5e20",
         )
         self.status_label.pack(fill=tk.X)
+
+    def _set_inspect_text(self, text: str) -> None:
+        self.inspect_text.configure(state=tk.NORMAL)
+        self.inspect_text.delete("1.0", tk.END)
+        self.inspect_text.insert("1.0", text)
+        self.inspect_text.configure(state=tk.DISABLED)
+
+    def _inspect_and_confirm_local_patch(
+        self, raw_path: str, *, ask_exec_confirm: bool = True
+    ) -> bool:
+        """检查本地补丁文件并在预览区展示详情；若是裸可执行文件则弹出二次确认。"""
+        target = Path(raw_path)
+        if target.is_dir():
+            self._set_inspect_text(
+                f"目录: {target.resolve()}\n类型: 补丁文件夹（安装时将递归写入目录下所有文件）"
+            )
+            self._inspected_key = (str(target.resolve()), "DIR")
+            return True
+
+        try:
+            inspection = inspect_patch_file(target)
+        except Exception as exc:
+            self._set_inspect_text(f"无法读取本地文件信息: {exc}")
+            self._inspected_key = None
+            return False
+
+        self._set_inspect_text(inspection.describe())
+        key = (str(inspection.path), inspection.sha256)
+        self._inspected_key = key
+
+        if inspection.is_bare_executable and ask_exec_confirm:
+            if self._confirmed_exec_key == key:
+                return True
+            ok = messagebox.askyesno(
+                "可执行文件安全确认",
+                "该文件是可执行文件，安装后会被游戏加载。\n"
+                "确认来源可信再继续。\n\n"
+                f"SHA256: {inspection.sha256}\n\n"
+                "是否继续？",
+            )
+            if not ok:
+                return False
+            self._confirmed_exec_key = key
+        return True
 
     def _set_status(self, text: str, *, is_error: bool = False) -> None:
         self.status_var.set(text)
@@ -482,16 +538,25 @@ class GalgamePatcherGUI:
         return "break"
 
     def paste_patch_path_from_clipboard(self) -> None:
-        """从系统剪贴板读取补丁文件路径或下载链接并填入补丁输入框。"""
+        """从系统剪贴板读取本地补丁路径并填入输入框（拒绝远程 URL）。"""
         try:
             raw = self.root.clipboard_get().strip().strip('"').strip("'")
         except tk.TclError:
-            messagebox.showwarning("剪贴板为空", "剪贴板中没有可用的文本路径或链接。")
+            messagebox.showwarning("剪贴板为空", "剪贴板中没有可用的文本路径。")
             return
         if not raw:
             return
+        if is_url(raw) or raw.lower().startswith(("http://", "https://")):
+            messagebox.showwarning(
+                "不支持远程 URL",
+                "出于安全考虑，本工具不再支持从 URL 直接安装补丁。\n"
+                "请先在浏览器下载到本地，再导入本地文件。",
+            )
+            return
         self.patch_source_var.set(raw)
         self.sha256_var.set("")
+        if Path(raw).exists():
+            self._inspect_and_confirm_local_patch(raw, ask_exec_confirm=True)
         self._set_status(f"已从剪贴板填入补丁路径: {raw}", is_error=False)
 
     def scan_games_async(self) -> None:
@@ -606,7 +671,10 @@ class GalgamePatcherGUI:
         if status.game_dir:
             self.game_dir_var.set(str(status.game_dir))
             self._gui_config["last_game_dir"] = str(status.game_dir)
-        self.patch_source_var.set(entry.patch_url or "")
+        # GUI 侧不再把清单的远程 URL 填进待安装输入框
+        self.patch_source_var.set("")
+        self._inspected_key = None
+        self._set_inspect_text("尚未导入本地补丁文件。请先通过“选择补丁文件...”导入并核对 SHA256。")
         self.password_var.set(entry.archive_password or "")
         self.sha256_var.set(entry.expected_sha256 or "")
         self.target_subdir_var.set(entry.target_subdir or "")
@@ -697,10 +765,20 @@ class GalgamePatcherGUI:
             ],
         )
         if path:
+            self._confirmed_exec_key = None
+            confirmed = self._inspect_and_confirm_local_patch(
+                path, ask_exec_confirm=True
+            )
+            if not confirmed:
+                self.patch_source_var.set("")
+                self._inspected_key = None
+                self._set_status("已取消导入未确认的可执行文件。", is_error=True)
+                return
             self.patch_source_var.set(path)
             self.sha256_var.set("")
             self._gui_config["last_patch_dir"] = str(Path(path).parent)
             self._save_gui_config()
+            self._set_status(f"已检查本地补丁文件并显示 SHA256: {Path(path).name}", is_error=False)
 
     def open_game_dir(self) -> None:
         game_dir = self.game_dir_var.get().strip()
@@ -728,8 +806,6 @@ class GalgamePatcherGUI:
                     default_query = entry.install_dir_name or entry.name
         if not default_query and self.game_dir_var.get().strip():
             default_query = Path(self.game_dir_var.get().strip()).name
-        if not default_query and self.patch_source_var.get().strip().startswith(("http://", "https://")):
-            default_query = self.patch_source_var.get().strip()
 
         query = self._prompt_search_query(default_query)
         if not query:
@@ -796,26 +872,41 @@ class GalgamePatcherGUI:
             return
 
         dialog = tk.Toplevel(self.root)
-        dialog.title(f"在线补丁搜索结果 - {query} (共 {len(candidates)} 条)")
-        dialog.geometry("820x420")
+        dialog.title(f"在线补丁搜索结果（仅作参考链接） - {query} (共 {len(candidates)} 条)")
+        dialog.geometry("940x480")
         dialog.transient(self.root)
 
-        frame = ttk.Frame(dialog, padding=10)
+        top_warn = tk.Label(
+            dialog,
+            text=(
+                "搜索结果为第三方链接，本工具不下载也不保证其安全。"
+                "双击可在浏览器打开，请自行下载后使用『选择补丁文件』导入。"
+            ),
+            fg="#8b0000",
+            anchor=tk.W,
+            padx=10,
+            pady=6,
+        )
+        top_warn.pack(fill=tk.X)
+
+        frame = ttk.Frame(dialog, padding=(10, 0, 10, 6))
         frame.pack(fill=tk.BOTH, expand=True)
 
-        cols = ("title", "source", "type", "lang", "url")
+        cols = ("trusted", "title", "source", "type", "lang", "url")
         tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
-        tree.heading("title", text="补丁标题")
+        tree.heading("trusted", text="可信")
+        tree.heading("title", text="标题")
         tree.heading("source", text="来源")
         tree.heading("type", text="类型")
         tree.heading("lang", text="语言")
-        tree.heading("url", text="网址 / 下载链接")
+        tree.heading("url", text="网址")
 
-        tree.column("title", width=220, anchor=tk.W)
-        tree.column("source", width=95, anchor=tk.CENTER)
-        tree.column("type", width=85, anchor=tk.CENTER)
-        tree.column("lang", width=80, anchor=tk.CENTER)
-        tree.column("url", width=300, anchor=tk.W)
+        tree.column("trusted", width=85, anchor=tk.CENTER)
+        tree.column("title", width=230, anchor=tk.W)
+        tree.column("source", width=105, anchor=tk.CENTER)
+        tree.column("type", width=75, anchor=tk.CENTER)
+        tree.column("lang", width=75, anchor=tk.CENTER)
+        tree.column("url", width=320, anchor=tk.W)
 
         scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
@@ -823,12 +914,14 @@ class GalgamePatcherGUI:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         for idx, cand in enumerate(candidates):
+            trust_text = "✔ 白名单" if cand.trusted else "未审核"
             kind_text = "直链包" if cand.is_direct_download else "发布网页"
             tree.insert(
                 "",
                 tk.END,
                 iid=str(idx),
                 values=(
+                    trust_text,
                     cand.title,
                     cand.source_site,
                     kind_text,
@@ -837,31 +930,48 @@ class GalgamePatcherGUI:
                 ),
             )
 
-        btn_bar = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        btn_bar = ttk.Frame(dialog, padding=(10, 4, 10, 4))
         btn_bar.pack(fill=tk.X)
 
-        def _use_selected() -> None:
+        exec_warn_var = tk.StringVar(value="")
+        exec_warn_label = tk.Label(
+            dialog, textvariable=exec_warn_var, fg="#c62828", anchor=tk.W, padx=10
+        )
+        exec_warn_label.pack(fill=tk.X, pady=(0, 8))
+
+        def _on_select_cand(_event: object) -> None:
             sel = tree.selection()
             if not sel:
+                exec_warn_var.set("")
                 return
             cand = candidates[int(sel[0])]
-            self.patch_source_var.set(cand.url)
-            self.sha256_var.set("")
-            self._set_status(f"已填入在线补丁链接: {cand.url}", is_error=False)
-            dialog.destroy()
+            if cand.bare_executable:
+                exec_warn_var.set("⚠ 该链接指向可执行文件，请谨慎下载")
+            else:
+                exec_warn_var.set(f"可信说明: {cand.trust_reason}")
 
-        def _open_browser() -> None:
+        def _open_browser(_event: object = None) -> None:
             sel = tree.selection()
             if not sel:
                 return
             cand = candidates[int(sel[0])]
             webbrowser.open(cand.url)
 
-        tree.bind("<Double-1>", lambda _e: _use_selected())
-        ttk.Button(btn_bar, text="填入选中链接", command=_use_selected).pack(
+        def _copy_link() -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            cand = candidates[int(sel[0])]
+            self.root.clipboard_clear()
+            self.root.clipboard_append(cand.url)
+            self._set_status(f"已复制链接到剪贴板: {cand.url}", is_error=False)
+
+        tree.bind("<<TreeviewSelect>>", _on_select_cand)
+        tree.bind("<Double-1>", _open_browser)
+        ttk.Button(btn_bar, text="在浏览器打开该页", command=_open_browser).pack(
             side=tk.LEFT, padx=(0, 8)
         )
-        ttk.Button(btn_bar, text="在浏览器打开该页", command=_open_browser).pack(
+        ttk.Button(btn_bar, text="复制链接", command=_copy_link).pack(
             side=tk.LEFT, padx=(0, 8)
         )
         ttk.Button(btn_bar, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT)
@@ -876,8 +986,24 @@ class GalgamePatcherGUI:
             return
         if not patch_source:
             messagebox.showwarning(
-                "缺少补丁源", "请先选择本地补丁文件、在线搜索补丁，或填写下载链接 (URL)。"
+                "缺少补丁源", "请先通过『选择补丁文件...』导入本地补丁文件。"
             )
+            return
+
+        # GUI 侧彻底禁止从 URL 直接安装补丁
+        if is_url(patch_source) or patch_source.lower().startswith(("http://", "https://")):
+            messagebox.showwarning(
+                "已禁止从 URL 直接安装",
+                "出于安全考虑，本工具不再支持从 URL 直接安装补丁。\n"
+                "请用『自动上网搜索』拿到链接，在浏览器下载后，\n"
+                "用『选择补丁文件...』导入本地文件。",
+            )
+            return
+
+        # 确认本地文件已检查预览且（如为可执行文件）经过二次确认
+        if not self._inspect_and_confirm_local_patch(
+            patch_source, ask_exec_confirm=not dry_run
+        ):
             return
 
         password = self.password_var.get().strip() or None

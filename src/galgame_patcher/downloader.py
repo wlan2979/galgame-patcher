@@ -15,7 +15,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional, Sequence, Union
 
 from ._version import __version__
-from .models import COMMON_ARCHIVE_EXTENSIONS, COMMON_PATCH_EXTENSIONS, OnlinePatchCandidate
+from .models import (
+    BARE_EXECUTABLE_SUFFIXES,
+    COMMON_ARCHIVE_EXTENSIONS,
+    OnlinePatchCandidate,
+)
 
 logger = logging.getLogger("galgame_patcher")
 
@@ -26,10 +30,29 @@ _CHUNK_SIZE = 64 * 1024
 _FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\r\n]+)")
 _FILENAME_RE = re.compile(r'filename\s*=\s*"?([^";\r\n]+)"?')
 
-_DIRECT_DOWNLOAD_SUFFIXES: tuple[str, ...] = (
-    COMMON_ARCHIVE_EXTENSIONS
-    + tuple(ext for ext in COMMON_PATCH_EXTENSIONS if ext not in (".txt", ".json", ".ini", ".cfg"))
+# 仅将压缩包视为“直链包”；裸可执行文件或散装文件不参与直链白名单。
+_DIRECT_DOWNLOAD_SUFFIXES: tuple[str, ...] = COMMON_ARCHIVE_EXTENSIONS
+
+# 这些格式一旦被复制进游戏目录就会被执行，是恶意软件最直接的载体，
+# 永远不视为可自动下载安装的补丁。
+_BARE_EXECUTABLE_SUFFIXES: tuple[str, ...] = BARE_EXECUTABLE_SUFFIXES
+
+# 官方发行商补丁域名白名单。刻意保持极短：白名单不是安全保证，
+# 只是「至少不是路人注册的仓库」这一层最低筛选。
+_TRUSTED_PATCH_DOMAINS: tuple[str, ...] = (
+    "nekonyansoft.com",
+    "jastusa.com",
+    "mangagamer.com",
+    "sekaiproject.com",
+    "frontwing.com",
 )
+
+# 可信 GitHub 仓库 owner 白名单。默认空 —— 需要用户自行确认后追加，
+# 因为「哪个 GitHub 账号是可信的补丁作者」没有通用答案。
+_TRUSTED_GITHUB_OWNERS: tuple[str, ...] = ()
+
+# GitHub 仓库搜索的最低 star 门槛
+DEFAULT_MIN_GITHUB_STARS = 10
 
 
 def is_url(source: Union[str, Path]) -> bool:
@@ -40,11 +63,33 @@ def is_url(source: Union[str, Path]) -> bool:
     return lowered.startswith(("http://", "https://", "file://"))
 
 
-def is_direct_patch_url(url: str) -> bool:
-    """判断某个 URL 路径是否直接指向压缩包或补丁文件。"""
+def _get_url_path_lower(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
-    path_lower = urllib.parse.unquote(parsed.path).lower()
+    return urllib.parse.unquote(parsed.path).lower()
+
+
+def is_executable_url(url: str) -> bool:
+    """判断 URL 路径是否以裸可执行文件/脚本后缀结尾。"""
+    path_lower = _get_url_path_lower(url)
+    return any(path_lower.endswith(ext) for ext in _BARE_EXECUTABLE_SUFFIXES)
+
+
+def is_direct_patch_url(url: str) -> bool:
+    """判断某个 URL 路径是否直接指向补丁压缩包（不含裸可执行文件）。"""
+    path_lower = _get_url_path_lower(url)
     return any(path_lower.endswith(ext) for ext in _DIRECT_DOWNLOAD_SUFFIXES)
+
+
+def _is_trusted_domain(url: str) -> bool:
+    """判断 URL 主机名是否命中官方发行商域名白名单或其子域名。"""
+    host = urllib.parse.urlparse(url).hostname
+    if not host:
+        return False
+    host_lower = host.lower()
+    return any(
+        host_lower == domain or host_lower.endswith("." + domain)
+        for domain in _TRUSTED_PATCH_DOMAINS
+    )
 
 
 def _build_opener(proxies: Optional[dict[str, str]] = None) -> urllib.request.OpenerDirector:
@@ -215,6 +260,7 @@ def scrape_patch_links_from_page(
 
         seen_urls.add(full_url)
         title = label or PurePosixPath(urllib.parse.urlparse(full_url).path).name or full_url
+        domain_trusted = _is_trusted_domain(full_url)
         results.append(
             OnlinePatchCandidate(
                 title=title,
@@ -222,6 +268,13 @@ def scrape_patch_links_from_page(
                 source_site=urllib.parse.urlparse(page_url).netloc or "WebPage",
                 is_direct_download=direct,
                 description=f"从页面 {page_url} 提取",
+                trusted=domain_trusted,
+                trust_reason=(
+                    "命中官方发行商域名白名单"
+                    if domain_trusted
+                    else "从网页提取，发布者未知"
+                ),
+                bare_executable=is_executable_url(full_url),
             )
         )
     return results
@@ -280,6 +333,15 @@ def crawl_vndb_patches(
                     continue
                 seen_urls.add(url)
                 label = str(link.get("label") or link.get("name") or "VNDB External")
+                domain_trusted = _is_trusted_domain(url)
+                vndb_trusted = bool(official and domain_trusted)
+                if vndb_trusted:
+                    reason = "VNDB 标记为官方发布，且域名命中发行商白名单"
+                elif official:
+                    reason = "VNDB 标记为官方，但域名不在发行商白名单内"
+                else:
+                    reason = "VNDB 记录的社区补丁，发布者未经审核"
+
                 candidates.append(
                     OnlinePatchCandidate(
                         title=f"{title} ({label})",
@@ -289,6 +351,9 @@ def crawl_vndb_patches(
                         language=lang_str,
                         official=official,
                         description=f"VNDB Release {rel_id} ({'官方补丁' if official else '社区补丁'})",
+                        trusted=vndb_trusted,
+                        trust_reason=reason,
+                        bare_executable=is_executable_url(url),
                     )
                 )
         elif rel_id:
@@ -304,6 +369,9 @@ def crawl_vndb_patches(
                         language=lang_str,
                         official=official,
                         description=f"VNDB Release {rel_id} 详情页",
+                        trusted=False,
+                        trust_reason="VNDB 详情页，需自行判断发布方",
+                        bare_executable=False,
                     )
                 )
 
@@ -313,23 +381,27 @@ def crawl_vndb_patches(
 def crawl_github_patch_releases(
     game_query: str,
     *,
+    min_stars: int = DEFAULT_MIN_GITHUB_STARS,
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
 ) -> list[OnlinePatchCandidate]:
-    """通过 GitHub 公开 API 搜索游戏相关开源补丁仓库及其 Release 补丁直链。"""
+    """通过 GitHub 公开 API 搜索游戏相关开源补丁仓库及其 Release 压缩包链接。"""
     query = game_query.strip()
     if not query:
         return []
 
     encoded_q = urllib.parse.quote(f"{query} patch")
-    search_url = f"https://api.github.com/search/repositories?q={encoded_q}&per_page=5"
+    search_url = f"https://api.github.com/search/repositories?q={encoded_q}&per_page=10"
     data = fetch_json(search_url, timeout=timeout, proxies=proxies)
     repos = data.get("items", []) if isinstance(data, dict) else []
 
     candidates: list[OnlinePatchCandidate] = []
     seen_urls: set[str] = set()
+    trusted_owners_lower = {o.lower() for o in _TRUSTED_GITHUB_OWNERS}
+    dropped_low_stars = 0
+    skipped_executables = 0
 
-    for repo in repos[:3]:
+    for repo in repos:
         if not isinstance(repo, dict):
             continue
         full_name = str(repo.get("full_name") or "")
@@ -337,6 +409,33 @@ def crawl_github_patch_releases(
         desc = str(repo.get("description") or "")
         if not full_name:
             continue
+
+        stars = int(repo.get("stargazers_count") or 0)
+        if stars < min_stars:
+            logger.debug(
+                "已跳过低 star GitHub 仓库 %s (%d stars < %d)",
+                full_name,
+                stars,
+                min_stars,
+            )
+            dropped_low_stars += 1
+            continue
+
+        owner_obj = repo.get("owner")
+        owner = (
+            str(owner_obj.get("login") or "")
+            if isinstance(owner_obj, dict)
+            else ""
+        )
+        if not owner and "/" in full_name:
+            owner = full_name.split("/", 1)[0]
+
+        owner_trusted = owner.lower() in trusted_owners_lower
+        trust_reason = (
+            "owner 在本地可信白名单内"
+            if owner_trusted
+            else f"GitHub 第三方仓库（{stars} stars），发布者未经审核"
+        )
 
         rel_api = f"https://api.github.com/repos/{full_name}/releases/latest"
         try:
@@ -351,7 +450,13 @@ def crawl_github_patch_releases(
                     continue
                 dl_url = str(asset.get("browser_download_url") or "")
                 asset_name = str(asset.get("name") or "")
-                if dl_url and dl_url not in seen_urls and is_direct_patch_url(dl_url):
+                if not dl_url:
+                    continue
+                if is_executable_url(dl_url):
+                    logger.warning("已跳过可执行文件资产: %s", dl_url)
+                    skipped_executables += 1
+                    continue
+                if dl_url not in seen_urls and is_direct_patch_url(dl_url):
                     seen_urls.add(dl_url)
                     candidates.append(
                         OnlinePatchCandidate(
@@ -361,6 +466,9 @@ def crawl_github_patch_releases(
                             is_direct_download=True,
                             version=tag_name,
                             description=desc or f"GitHub Release ({full_name})",
+                            trusted=owner_trusted,
+                            trust_reason=trust_reason,
+                            bare_executable=False,
                         )
                     )
 
@@ -368,14 +476,22 @@ def crawl_github_patch_releases(
             seen_urls.add(html_url)
             candidates.append(
                 OnlinePatchCandidate(
-                    title=full_name,
+                    title=f"{full_name} ({stars} stars)",
                     url=html_url,
                     source_site="GitHub",
                     is_direct_download=False,
                     description=desc or "GitHub 补丁项目主页",
+                    trusted=owner_trusted,
+                    trust_reason=trust_reason,
+                    bare_executable=is_executable_url(html_url),
                 )
             )
 
+    logger.info(
+        "GitHub 搜索汇总：丢弃低 star 仓库 %d 个，跳过可执行文件资产 %d 个",
+        dropped_low_stars,
+        skipped_executables,
+    )
     return candidates
 
 
@@ -386,7 +502,7 @@ def discover_patches_online(
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
 ) -> list[OnlinePatchCandidate]:
-    """自动从网站爬取对应游戏的补丁候选列表（支持直接爬网页 URL、VNDB 补丁库与 GitHub Releases）。"""
+    """自动从网站爬取对应游戏的补丁候选列表（只返回链接信息，不参与自动下载）。"""
     target = query_or_url.strip()
     if not target:
         return []
@@ -427,8 +543,14 @@ def discover_patches_online(
     except Exception as exc:
         logger.debug("GitHub 补丁搜索失败: %s", exc)
 
-    # 优先将可直接下载的直链与官方补丁排在前面
-    results.sort(key=lambda c: (not c.is_direct_download, not c.official))
+    results.sort(
+        key=lambda c: (
+            not c.trusted,
+            c.bare_executable,
+            not c.is_direct_download,
+            not c.official,
+        )
+    )
     return results
 
 

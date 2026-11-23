@@ -5,6 +5,12 @@
 > [!NOTE]
 > 库与命令行只依赖 Python 标准库。桌面 GUI 额外需要 `tkinter`：Windows / macOS 官方安装包已自带；Debian/Ubuntu 需执行 `sudo apt install python3-tk`。缺少 tkinter 时仅 GUI 不可用，库与 CLI 照常工作。
 
+> [!WARNING]
+> **安全说明**
+> - 本工具不验证第三方补丁的安全性；请只从官方或你信任的来源获取补丁；安装前请核对 SHA256。
+> - **搜索只提供链接，不自动下载**：`galpatch search` 与 GUI 搜索窗格仅列出公开链接供参考，请自行在浏览器核验并下载到本地，再通过工具导入本地文件核对 SHA256 后安装。
+> - **拒绝自动下载或直接安装裸可执行文件**：`.exe` / `.dll` / `.msi` / `.bat` / `.ps1` 等格式永远不作为直链包自动下载；GUI 侧彻底禁止从远程 URL 直接安装，CLI 侧拒绝无 `expected_sha256` 的远程 URL（除非显式传入 `--allow-untrusted-url`）。
+
 > [!IMPORTANT]
 > **使用声明**
 > - 本项目只是一个通用的本地文件安装 / 备份 / 还原工具，**不托管、不提供、不索引任何游戏补丁或游戏资源**，内置清单仅包含一个格式示例条目。
@@ -12,7 +18,7 @@
 > - 请勿在清单中收录指向盗版资源或未经授权分发内容的链接，本仓库也不接受此类清单或 PR。
 > - 修改游戏文件可能违反部分游戏的用户协议，后果由使用者自行承担。
 
-## 核心特性 (v0.3.0)
+## 核心特性 (v0.3.1)
 
 - **事务化安装与安全回滚（零毁档保护）**：
   - 安装过程每备份/覆盖一个文件即原子写入 `manifest.json` (`in_progress` → `committed`)；中途遇到任何异常（权限不足、磁盘满、写入后 SHA256 校验失败等）会**自动回滚本轮全部变更**，并将残留进度恢复逻辑集成在 `rollback()` 中。
@@ -22,9 +28,12 @@
 - **支持 Steam + 手工登记 + 非 Steam 深度扫描**：
   - 自动读取 Windows 注册表与 Steam `libraryfolders.vdf` / `appmanifest_<appid>.acf`。
   - 支持 `galpatch add-game <path>` 将 DMM / DLsite / 实体盘等非 Steam 游戏登记到 `%APPDATA%\galgame-patcher\games.json`；支持 `--deep` 深度扫描常见目录中的特征 Galgame 文件夹。
-- **清单管理与在线补丁自动爬取**：
+- **在线补丁检索（只给链接，不自动下载）与本地文件核验**：
+  - 提供 `galpatch search <游戏名或网页URL>`（及 GUI 内置搜索按钮），检索公开数据库 (VNDB API v2)、GitHub Releases（最低 10 stars、跳过可执行资产并标注白名单/未审核状态）或指定网页链接。
+  - 搜索结果**只提供链接与可信度提示，不自动下载**；用户可通过浏览器下载后导入本地文件，使用 `galpatch verify-file <path>` 或 GUI 预览区核对文件大小、修改时间与 SHA256（导入裸可执行文件需强制二次确认）。
+  - 远程 URL 安装必须配置 `expected_sha256` 锁定内容，否则默认拒绝安装（`UntrustedSourceError`）。
+- **清单管理**：
   - 支持加载本地/远程 JSON 清单，提供 `galpatch catalog update / list / verify` 进行版本化增量合并（保留 `.bak`）与 `HEAD` 链接探活。
-  - 提供 `galpatch search <游戏名或网页URL>`（及 GUI 内置搜索按钮），自动从公开补丁数据库 (VNDB API v2)、GitHub Releases 或指定补丁发布网页提取候选链接与直链。
 - **桌面图形界面 (GUI) & 单文件 `.exe`**：
   - 左右分栏布局（左侧库列表 + 右侧详情/操作/日志面板），带 200ms 防抖搜索、后台队列异步进度与速度显示、`Ctrl+V` 剪贴板粘贴路径、窗口与目录记忆、`%APPDATA%\galgame-patcher\logs\gui.log` 日志落盘及危险操作二次确认。
   - 执行 `galpatch gui` 或直接双击 Release 中提供的 `galgame-patcher-windows-x64.exe` 即可使用。
@@ -78,34 +87,38 @@ galpatch scan --only-installed --include-manual --deep
 # 2) 手工登记非 Steam 游戏目录（自动推断目录名和最大 .exe）
 galpatch add-game "D:\Games\MyDlsiteGame"
 
-# 3) 自动上网搜索公开补丁信息 (VNDB / GitHub Releases / 指定网页)
+# 3) 上网检索公开补丁链接（只列出链接与可信度，不下载任何文件）
 galpatch search "Game Title"
-galpatch search "https://example.com/patch-release-page.html"
+galpatch search "Game Title" --open 1
+galpatch search "https://example.com/patch-release-page.html" --json
 
-# 4) 清单远程更新、列表查看与链接探活
+# 4) 安装前检查本地补丁文件信息并核对 SHA256
+galpatch verify-file ./downloaded_patch.zip
+
+# 5) 清单远程更新、列表查看与链接探活
 galpatch catalog update https://example.com/catalog.json
 galpatch catalog list
 galpatch catalog verify
 
-# 5) 仅预览将修改的文件（Dry-Run，不写盘）
+# 6) 仅预览将修改的文件（Dry-Run，不写盘）
 galpatch apply ./patch.zip --game-name "MyGame" --dry-run
 
-# 6) 使用自定义清单自动定位游戏、下载并安装补丁
+# 7) 使用自定义清单自动定位游戏、校验 SHA256 后安装补丁
 galpatch auto my_game --catalog ./my_catalog.json
 
-# 7) 直接传入远程 URL 或加密 .7z / .zip 安装补丁（加密包需提供密码；--force-locked 可跳过占用检查）
-galpatch apply https://example.com/official_update.7z --app-id 123456 --password <密码>
+# 8) 直接传入远程 URL 时必须提供预期 SHA256（无 SHA256 需显式加 --allow-untrusted-url）
+galpatch apply https://example.com/official_update.7z --app-id 123456 --sha256 <64位哈希> --password <密码>
 
-# 8) 不确定是哪个密码时，可多次传入候选密码（仅尝试你提供的这些）
+# 9) 不确定是哪个密码时，可多次传入候选密码（仅尝试你提供的这些）
 galpatch apply ./patch.zip --game-name "MyGame" --try-password pw1 --try-password pw2
 
-# 9) 仅查找并打印游戏安装路径
+# 10) 仅查找并打印游戏安装路径
 galpatch locate --app-id 123456
 
-# 10) 计算补丁文件的 SHA256 值
+# 11) 计算补丁文件的 SHA256 值
 galpatch hash ./patch.zip
 
-# 11) 一键卸载补丁并恢复游戏目录
+# 12) 一键卸载补丁并恢复游戏目录
 galpatch rollback "D:\SteamLibrary\steamapps\common\MyGame"
 ```
 

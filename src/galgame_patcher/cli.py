@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import webbrowser
 from pathlib import Path
 from typing import Optional, Sequence
 
 from .catalog import PatchCatalog
 from .downloader import discover_patches_online
 from .locator import ManualLocator, SteamLocator
-from .models import ConcurrencyError, GameRunningError
-from .patcher import GalgamePatcher, compute_sha256
+from .models import ConcurrencyError, GameRunningError, UntrustedSourceError
+from .patcher import GalgamePatcher, compute_sha256, inspect_patch_file
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="仅预览将覆盖或新增的文件列表，不实际写入磁盘（P3-2）",
+    )
+    apply_parser.add_argument(
+        "--allow-untrusted-url",
+        action="store_true",
+        help="【高风险】允许从未经审核且无 SHA256 校验的远程 URL 下载并安装补丁",
     )
 
     # scan 子命令
@@ -118,11 +125,32 @@ def build_parser() -> argparse.ArgumentParser:
     cat_verify = catalog_sub.add_parser("verify", help="对清单中的每个补丁链接发起 HEAD 请求探活")
     cat_verify.add_argument("--catalog", help="清单文件路径或远程 URL")
 
-    # search 子命令（自动去公开补丁站爬取）
+    # search 子命令（只列出链接，不下载文件）
     search_parser = subparsers.add_parser(
-        "search", help="自动从 VNDB / GitHub Releases / 指定网页爬取对应游戏的补丁链接"
+        "search",
+        help="从 VNDB / GitHub Releases / 指定网页检索补丁链接（只列出链接，不下载文件）",
     )
     search_parser.add_argument("query", help="游戏名称（英文/日文/中文）或要爬取的补丁网页 URL")
+    search_parser.add_argument(
+        "--open",
+        dest="open_index",
+        type=int,
+        metavar="N",
+        help="直接在系统浏览器中打开第 N 条搜索结果的链接",
+    )
+    search_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="以 JSON 格式输出搜索结果",
+    )
+
+    # verify-file 子命令（安装前本地文件安全核验）
+    verify_file_parser = subparsers.add_parser(
+        "verify-file",
+        help="检查本地补丁文件大小、修改时间、类型与 SHA256（安装前核对）",
+    )
+    verify_file_parser.add_argument("path", help="待检查的本地补丁文件路径")
 
     # auto 子命令
     auto_parser = subparsers.add_parser(
@@ -147,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="仅预览变更而不实际写入磁盘",
+    )
+    auto_parser.add_argument(
+        "--allow-untrusted-url",
+        action="store_true",
+        help="【高风险】允许清单中未配置 expected_sha256 的条目从远程下载安装",
     )
 
     # gui 子命令
@@ -219,6 +252,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 password_candidates=args.password_candidates,
                 force_locked=args.force_locked,
                 dry_run=args.dry_run,
+                allow_untrusted_url=args.allow_untrusted_url,
             )
             print(result.message)
             print(f"游戏目录: {result.game_dir}")
@@ -309,15 +343,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.command == "search":
             candidates = discover_patches_online(args.query)
-            if not candidates:
-                print(f"未搜索到与 {args.query!r} 相关的在线补丁。")
+            if args.open_index is not None:
+                if args.open_index < 1 or args.open_index > len(candidates):
+                    print(
+                        f"错误: --open 序号超出范围（共 {len(candidates)} 条，指定了 {args.open_index}）",
+                        file=sys.stderr,
+                    )
+                    return 1
+                target_cand = candidates[args.open_index - 1]
+                webbrowser.open(target_cand.url)
+                if not args.json_output:
+                    print(
+                        f"已在系统浏览器中打开第 {args.open_index} 条链接: {target_cand.url}"
+                    )
+
+            if args.json_output:
+                payload = [
+                    {
+                        "trusted": c.trusted,
+                        "trust_reason": c.trust_reason,
+                        "bare_executable": c.bare_executable,
+                        "url": c.url,
+                        "title": c.title,
+                        "source_site": c.source_site,
+                        "is_direct_download": c.is_direct_download,
+                        "version": c.version,
+                        "language": c.language,
+                        "official": c.official,
+                        "description": c.description,
+                    }
+                    for c in candidates
+                ]
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
                 return 0
-            print(f"共找到 {len(candidates)} 条补丁候选：")
+
+            if not candidates:
+                print(
+                    f"未搜索到与 {args.query!r} 相关的在线补丁（本命令只列出链接，不下载任何文件）。"
+                )
+                return 0
+
+            print(
+                f"共找到 {len(candidates)} 条补丁候选（本命令只列出链接，不下载任何文件）：\n"
+            )
             for idx, cand in enumerate(candidates, start=1):
+                trust_tag = "可信" if cand.trusted else "未审核"
                 kind = "直链包" if cand.is_direct_download else "发布页"
                 lang = f" [{cand.language}]" if cand.language else ""
-                print(f"{idx}. [{kind} | {cand.source_site}]{lang} {cand.title}")
+                print(
+                    f"{idx}. [{trust_tag}] [{kind} | {cand.source_site}]{lang} {cand.title}"
+                )
                 print(f"   URL: {cand.url}")
+                print(f"   说明: {cand.trust_reason}")
+                if cand.bare_executable:
+                    print("   ⚠ 该链接指向可执行文件，下载后请务必核对哈希再安装")
+
+            print(
+                "\n以上链接均来自第三方，本工具不保证其安全性。\n"
+                "请用浏览器自行下载，下载后在工具里用本地文件路径安装，\n"
+                "安装前会显示文件 SHA256 供你核对。"
+            )
+            return 0
+
+        if args.command == "verify-file":
+            inspection = inspect_patch_file(args.path)
+            print(inspection.describe())
+            if inspection.is_bare_executable:
+                print(
+                    "\n⚠ 警告：该文件是可执行文件，安装后会被游戏直接加载，请确认来源可信！"
+                )
             return 0
 
         if args.command == "auto":
@@ -332,6 +426,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 password=args.password,
                 force_locked=args.force_locked,
                 dry_run=args.dry_run,
+                allow_untrusted_url=args.allow_untrusted_url,
             )
             print(result.message)
             print(f"游戏目录: {result.game_dir}")
@@ -368,7 +463,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except GameRunningError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
-    except ConcurrencyError as exc:
+    except (ConcurrencyError, UntrustedSourceError) as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
