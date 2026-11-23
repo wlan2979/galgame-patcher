@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sys
@@ -136,6 +137,42 @@ class TestV031Security(unittest.TestCase):
             self.assertEqual(cli_main(args + ["not-a-digest"]), 1)
         self.assertIn("SHA256 不匹配", errors.getvalue())
         self.assertIn("64 位十六进制值", errors.getvalue())
+
+    def test_remote_cache_separates_same_named_files_and_rejects_short_downloads(self) -> None:
+        first_url = "https://example.com/first/patch.zip"
+        second_url = "https://example.com/second/patch.zip"
+
+        def response_for(url: str, data: bytes, declared_size: int) -> mock.MagicMock:
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.geturl.return_value = url
+            response.info.return_value = {"Content-Length": str(declared_size)}
+            response.read.side_effect = [data, b""]
+            return response
+
+        responses = [response_for(first_url, b"first", 5), response_for(second_url, b"second", 6)]
+        with mock.patch(
+            "galgame_patcher.downloader.tempfile.gettempdir", return_value=str(self.root)
+        ), mock.patch("galgame_patcher.downloader.open_url_request", side_effect=responses):
+            first = downloader.download_patch(
+                first_url, expected_sha256=hashlib.sha256(b"first").hexdigest()
+            )
+            second = downloader.download_patch(
+                second_url, expected_sha256=hashlib.sha256(b"second").hexdigest()
+            )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), b"first")
+        self.assertEqual(second.read_bytes(), b"second")
+
+        with mock.patch(
+            "galgame_patcher.downloader.open_url_request",
+            return_value=response_for(second_url, b"truncated", 20),
+        ):
+            with self.assertRaisesRegex(ValueError, "下载大小不符"):
+                downloader.download_patch(second_url, dest_dir=second.parent)
+        self.assertEqual(second.read_bytes(), b"second")
+        self.assertEqual(list(second.parent.iterdir()), [second])
 
     def test_rule3_github_and_vndb_trust_filtering(self) -> None:
         fake_search_resp = {

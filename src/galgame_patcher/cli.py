@@ -9,6 +9,7 @@ import webbrowser
 from pathlib import Path
 from typing import Optional, Sequence
 
+from ._version import __version__
 from .catalog import PatchCatalog
 from .downloader import (
     OFFICIAL_PATCH_PORTALS,
@@ -28,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="galgame-patcher",
         description="一键定位、自动爬取并给对应 Galgame 安装/还原补丁的命令行与桌面工具",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # apply 子命令
@@ -53,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument(
         "--no-backup",
         action="store_true",
-        help="覆盖文件前不进行自动备份",
+        help="本轮成功后不保留新增备份，已有备份继续保留",
     )
     apply_parser.add_argument(
         "--no-strip",
@@ -188,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto_parser.add_argument(
         "--no-backup",
         action="store_true",
-        help="覆盖文件前不进行自动备份",
+        help="本轮成功后不保留新增备份，已有备份继续保留",
     )
     auto_parser.add_argument(
         "--force-locked",

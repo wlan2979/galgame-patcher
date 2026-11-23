@@ -448,18 +448,15 @@ class GalgamePatcher:
                 )
 
             try:
+                for snapshot in backup_root.glob("install-*"):
+                    if snapshot.is_dir() and not snapshot.is_symlink():
+                        shutil.rmtree(snapshot)
                 if backup_files_root.exists():
                     shutil.rmtree(backup_files_root)
                 if manifest_path.exists():
                     manifest_path.unlink()
             except Exception as exc:
                 logger.warning("清理备份内容失败: %s", exc)
-
-        if backup_root.exists():
-            try:
-                shutil.rmtree(backup_root)
-            except Exception as exc:
-                logger.warning("清理备份目录失败: %s", exc)
 
         return PatchResult(
             success=True,
@@ -609,19 +606,23 @@ class GalgamePatcher:
 
             existing_backed_up: set[str] = set()
             existing_newly_added: set[str] = set()
+            previous_manifest = None
             if manifest_path.is_file():
                 try:
                     old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    if old_manifest.get("status") != "rolled_back":
-                        existing_backed_up.update(old_manifest.get("backed_up_files", []))
-                        existing_newly_added.update(old_manifest.get("newly_added_files", []))
                 except (OSError, json.JSONDecodeError):
-                    pass
+                    old_manifest = {}
+                if old_manifest.get("status") == "in_progress":
+                    raise ValueError("上次安装未完成，请先回滚后重试")
+                if old_manifest and old_manifest.get("status") != "rolled_back":
+                    previous_manifest = old_manifest
+                    existing_backed_up.update(old_manifest.get("backed_up_files", []))
+                    existing_newly_added.update(old_manifest.get("newly_added_files", []))
 
             installed_files: list[str] = []
             backed_up_this_run: list[str] = []
-            newly_added_this_run: list[str] = []
-            overwritten_this_run: list[str] = []
+            prior_contents: dict[str, Optional[Path]] = {}
+            snapshot_dir: Optional[Path] = None
 
             def _sync_manifest(status: str) -> None:
                 payload = {
@@ -634,28 +635,36 @@ class GalgamePatcher:
 
             _sync_manifest("in_progress")
 
-            def _rollback_current_transaction() -> None:
-                for rel_posix in reversed(overwritten_this_run):
-                    backup_file = backup_files_root / Path(rel_posix)
-                    target_file = game_dir / Path(rel_posix)
-                    if backup_file.is_file():
-                        try:
-                            target_file.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(backup_file, target_file)
-                        except OSError:
-                            pass
-
-                for rel_posix in reversed(newly_added_this_run):
+            def _rollback_current_transaction() -> str:
+                failures = []
+                for rel_posix, snapshot in reversed(prior_contents.items()):
                     target_file = game_dir / Path(rel_posix)
                     try:
-                        if target_file.is_file():
-                            target_file.unlink()
+                        if snapshot is None:
+                            target_file.unlink(missing_ok=True)
                             self._cleanup_empty_parents(target_file.parent, game_dir)
-                    except OSError:
-                        pass
-                    existing_newly_added.discard(rel_posix)
+                        else:
+                            target_file.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(snapshot, target_file)
+                    except OSError as exc:
+                        failures.append(f"{rel_posix} ({exc})")
 
-                _sync_manifest("rolled_back")
+                if failures:
+                    return f"自动回滚未完成，备份已保留：{', '.join(failures)}"
+
+                try:
+                    if previous_manifest is None:
+                        existing_backed_up.clear()
+                        existing_newly_added.clear()
+                        _sync_manifest("rolled_back")
+                    else:
+                        _write_manifest_atomic(manifest_path, previous_manifest)
+                except OSError as exc:
+                    return f"文件已还原，但备份清单恢复失败：{exc}"
+
+                if snapshot_dir is not None:
+                    shutil.rmtree(snapshot_dir, ignore_errors=True)
+                return "已自动回滚，游戏目录未受影响"
 
             try:
                 for src_file, dst_file in file_pairs:
@@ -663,21 +672,27 @@ class GalgamePatcher:
                     expected_file_hash = _raw_sha256(src_file)
 
                     if dst_file.exists():
-                        if rel_posix not in existing_newly_added:
-                            backup_target = backup_files_root / Path(rel_posix)
-                            if not backup_target.exists():
-                                backup_target.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.copy2(dst_file, backup_target)
+                        if rel_posix in existing_backed_up or rel_posix in existing_newly_added:
+                            if snapshot_dir is None:
+                                snapshot_dir = Path(
+                                    tempfile.mkdtemp(prefix="install-", dir=backup_root)
+                                )
+                            snapshot = snapshot_dir / rel_posix
+                            snapshot.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(dst_file, snapshot)
+                        else:
+                            snapshot = backup_files_root / rel_posix
+                            snapshot.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(dst_file, snapshot)
                             existing_backed_up.add(rel_posix)
                             backed_up_this_run.append(rel_posix)
-                            overwritten_this_run.append(rel_posix)
-                            _sync_manifest("in_progress")
                     else:
+                        snapshot = None
                         if rel_posix not in existing_backed_up:
                             existing_newly_added.add(rel_posix)
-                            newly_added_this_run.append(rel_posix)
-                            _sync_manifest("in_progress")
 
+                    _sync_manifest("in_progress")
+                    prior_contents[rel_posix] = snapshot
                     dst_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src_file, dst_file)
                     installed_files.append(rel_posix)
@@ -690,22 +705,28 @@ class GalgamePatcher:
                             f"写入后 SHA256 校验不一致: 预期 {expected_file_hash}，"
                             f"实际 {written_hash}"
                         )
-                        _rollback_current_transaction()
+                        rollback_note = _rollback_current_transaction()
                         return PatchResult(
                             success=False,
                             game_dir=game_dir,
                             installed_files=[],
                             backed_up_files=[],
-                            backup_dir=backup_root if backup else None,
-                            message=f"安装后文件校验失败 ({rel_posix})，已自动回滚，游戏目录未受影响。",
+                            backup_dir=backup_root,
+                            message=f"安装后文件校验失败 ({rel_posix})，{rollback_note}。",
                             failed_files=[rel_posix],
                             failed_reasons={rel_posix: reason},
                             verified=False,
                         )
 
+                if backup:
+                    _sync_manifest("committed")
+                elif previous_manifest is not None:
+                    _write_manifest_atomic(manifest_path, previous_manifest)
+                else:
+                    manifest_path.unlink()
+
             except BaseException as exc:
-                _rollback_current_transaction()
-                note = f"{exc}（已自动回滚，游戏目录未受影响）"
+                note = f"{exc}（{_rollback_current_transaction()}）"
                 if isinstance(exc, PermissionError):
                     raise PermissionError(note) from exc
                 if isinstance(exc, OSError):
@@ -717,15 +738,17 @@ class GalgamePatcher:
                         raise RuntimeError(note) from exc
                 raise
 
+            if snapshot_dir is not None:
+                shutil.rmtree(snapshot_dir, ignore_errors=True)
+
             if backup:
-                _sync_manifest("committed")
                 used_backup_dir: Optional[Path] = backup_root
             else:
                 try:
-                    if backup_files_root.exists():
-                        shutil.rmtree(backup_files_root)
-                    if manifest_path.exists():
-                        manifest_path.unlink()
+                    for rel_posix in backed_up_this_run:
+                        snapshot = backup_files_root / rel_posix
+                        snapshot.unlink(missing_ok=True)
+                        self._cleanup_empty_parents(snapshot.parent, backup_root)
                 except Exception as exc:
                     logger.warning("清理临时事务备份失败: %s", exc)
                 used_backup_dir = None

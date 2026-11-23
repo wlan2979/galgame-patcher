@@ -1117,18 +1117,22 @@ def download_patch(
     if is_executable_url(url) or _has_executable_suffix(requested_name):
         raise ValueError("远程下载不支持裸可执行文件或脚本")
 
-    cache_dir = (
-        Path(dest_dir)
-        if dest_dir is not None
-        else Path(tempfile.gettempdir()) / "galgame_patcher_cache"
-    )
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
     normalized_expected = (
         expected_sha256.strip().lower() if expected_sha256 else None
     )
+    if expected_sha256 is not None and (
+        not normalized_expected or not re.fullmatch(r"[0-9a-f]{64}", normalized_expected)
+    ):
+        raise ValueError("预期 SHA256 必须为 64 位十六进制值")
 
-    if filename:
+    if dest_dir is None:
+        cache_key = hashlib.sha256(f"{url}\0{normalized_expected or ''}".encode()).hexdigest()
+        cache_dir = Path(tempfile.gettempdir()) / "galgame_patcher_cache" / cache_key
+    else:
+        cache_dir = Path(dest_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if requested_name:
         initial_target = cache_dir / requested_name
         if initial_target.is_file() and normalized_expected:
             if _compute_file_sha256(initial_target) == normalized_expected:
@@ -1162,11 +1166,13 @@ def download_patch(
                 else None
             )
 
-            part_path = cache_dir / f"{resolved_name}.part"
             digest = hashlib.sha256()
             downloaded = 0
 
-            with part_path.open("wb") as fh:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=cache_dir, prefix=".galpatch-", suffix=".part", delete=False
+            ) as fh:
+                part_path = Path(fh.name)
                 while True:
                     chunk = response.read(_CHUNK_SIZE)
                     if not chunk:
@@ -1177,6 +1183,9 @@ def download_patch(
                     if progress_callback:
                         progress_callback(downloaded, total_bytes)
 
+            if total_bytes is not None and downloaded != total_bytes:
+                raise ValueError(f"下载大小不符: 预期 {total_bytes} 字节，实际 {downloaded} 字节")
+
             if normalized_expected:
                 actual_hash = digest.hexdigest().lower()
                 if actual_hash != normalized_expected:
@@ -1184,8 +1193,6 @@ def download_patch(
                         f"下载补丁 SHA256 校验失败: 预期 {normalized_expected}，实际 {actual_hash}"
                     )
 
-            if target_path.exists():
-                target_path.unlink()
             part_path.replace(target_path)
             part_path = None
             return target_path

@@ -130,6 +130,71 @@ class TestV030Improvements(unittest.TestCase):
         self.assertEqual((self.game_dir / "a.xp3").read_bytes(), b"ORIG_A")
         self.assertFalse((self.game_dir / "crash_new.xp3").exists())
 
+    def test_failed_second_patch_preserves_previous_install_and_backup(self) -> None:
+        first = self.root / "first"
+        first.mkdir()
+        (first / "a.xp3").write_bytes(b"FIRST_A")
+        (first / "addon.xp3").write_bytes(b"FIRST_ADDON")
+        self.assertTrue(self.patcher.apply(first, game_dir=self.game_dir).success)
+        manifest = self.game_dir / ".galpatch_backup" / "manifest.json"
+        previous_manifest = manifest.read_bytes()
+
+        second = self.root / "second"
+        second.mkdir()
+        (second / "a.xp3").write_bytes(b"SECOND_A")
+        (second / "addon.xp3").write_bytes(b"SECOND_ADDON")
+        (second / "b.xp3").write_bytes(b"SECOND_B")
+        real_copy2 = shutil.copy2
+
+        def fail_last_write(src: Path, dst: Path) -> object:
+            if src == second / "b.xp3":
+                raise OSError("模拟第二次安装写入失败")
+            return real_copy2(src, dst)
+
+        with mock.patch("galgame_patcher.patcher.shutil.copy2", side_effect=fail_last_write):
+            with self.assertRaisesRegex(OSError, "已自动回滚"):
+                self.patcher.apply(second, game_dir=self.game_dir)
+
+        self.assertEqual((self.game_dir / "a.xp3").read_bytes(), b"FIRST_A")
+        self.assertEqual((self.game_dir / "addon.xp3").read_bytes(), b"FIRST_ADDON")
+        self.assertEqual((self.game_dir / "b.xp3").read_bytes(), b"ORIG_B")
+        self.assertEqual(manifest.read_bytes(), previous_manifest)
+        self.assertTrue(self.patcher.rollback(self.game_dir).success)
+        self.assertEqual((self.game_dir / "a.xp3").read_bytes(), b"ORIG_A")
+        self.assertFalse((self.game_dir / "addon.xp3").exists())
+
+    def test_failed_automatic_restore_keeps_recovery_manifest(self) -> None:
+        source = self.root / "a.xp3"
+        source.write_bytes(b"NEW_A")
+        real_copy2 = shutil.copy2
+
+        def fail_writes_to_game(src: Path, dst: Path) -> object:
+            if dst == self.game_dir / "a.xp3":
+                raise PermissionError("模拟安装和自动还原时目标不可写")
+            return real_copy2(src, dst)
+
+        with mock.patch("galgame_patcher.patcher.shutil.copy2", side_effect=fail_writes_to_game):
+            with self.assertRaisesRegex(PermissionError, "自动回滚未完成，备份已保留"):
+                self.patcher.apply(source, game_dir=self.game_dir)
+
+        manifest = self.game_dir / ".galpatch_backup" / "manifest.json"
+        self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["status"], "in_progress")
+        with self.assertRaisesRegex(ValueError, "请先回滚"):
+            self.patcher.apply(source, game_dir=self.game_dir)
+        self.assertTrue(self.patcher.rollback(self.game_dir).success)
+
+    def test_install_without_backup_does_not_discard_previous_backup(self) -> None:
+        first = self.root / "a.xp3"
+        first.write_bytes(b"FIRST_A")
+        second = self.root / "b.xp3"
+        second.write_bytes(b"SECOND_B")
+        self.assertTrue(self.patcher.apply(first, game_dir=self.game_dir).success)
+        self.assertTrue(self.patcher.apply(second, game_dir=self.game_dir, backup=False).success)
+
+        self.assertTrue(self.patcher.rollback(self.game_dir).success)
+        self.assertEqual((self.game_dir / "a.xp3").read_bytes(), b"ORIG_A")
+        self.assertEqual((self.game_dir / "b.xp3").read_bytes(), b"SECOND_B")
+
     def test_p0_2_locked_file_precheck_and_cli_exit_code_2(self) -> None:
         """P0-2: 目标文件被占用时抛 GameRunningError，游戏目录零改动，CLI 返回退出码 2。"""
         patch_file = self.root / "a.xp3"

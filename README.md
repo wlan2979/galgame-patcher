@@ -7,12 +7,16 @@
 - **Windows x64 桌面版**从 [Releases](https://github.com/wlan2979/galgame-patcher/releases) 下载 `galgame-patcher-windows-x64.exe`，双击启动。独立版无需安装 Python。
 - **Python 库与命令行**可从 Releases 下载 wheel，也可克隆仓库后从源码安装。
 
+新版 Release 附带 `SHA256SUMS.txt`，可用其中的 SHA256 核对下载文件。
+
 ```bash
 git clone https://github.com/wlan2979/galgame-patcher.git
 cd galgame-patcher
 python -m pip install -e .
 galpatch gui
 ```
+
+使用 `galpatch --version` 查看已安装的版本。
 
 | 平台 | 工具与测试 |
 | --- | --- |
