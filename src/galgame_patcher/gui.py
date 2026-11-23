@@ -106,8 +106,10 @@ class GalgamePatcherGUI:
         self._statuses: list[InstalledGameStatus] = []
         self._filtered_indices: list[int] = []
         self._busy = False
+        self._closing = False
         self._cancel_scan_flag = False
         self._search_after_id: Optional[str] = None
+        self._poll_after_id: Optional[str] = None
         self._ui_queue: queue.Queue[tuple[Any, ...]] = queue.Queue()
         self._active_thread: Optional[threading.Thread] = None
         self._confirmed_exec_key: Optional[tuple[str, str]] = None
@@ -137,7 +139,7 @@ class GalgamePatcherGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Control-v>", self._on_paste_shortcut)
         self.root.bind("<Control-V>", self._on_paste_shortcut)
-        self.root.after(100, self._poll_queue)
+        self._poll_after_id = self.root.after(100, self._poll_queue)
         self.scan_games_async()
 
     def _load_gui_config(self) -> dict[str, Any]:
@@ -165,6 +167,10 @@ class GalgamePatcherGUI:
             logger.debug("保存 GUI 配置失败: %s", exc)
 
     def _on_close(self) -> None:
+        self._closing = True
+        if self._poll_after_id is not None:
+            self.root.after_cancel(self._poll_after_id)
+            self._poll_after_id = None
         self._cancel_scan_flag = True
         if self._active_thread is not None and self._active_thread.is_alive():
             self._active_thread.join(timeout=1.0)
@@ -480,60 +486,79 @@ class GalgamePatcherGUI:
             btn.configure(state=state)
 
     def _poll_queue(self) -> None:
-        """每 100ms 轮询后台线程通过 queue.Queue 发回的事件并刷新 UI（P3-1 #4）。"""
+        """轮询后台事件，记录单个事件的错误并继续处理其余事件。"""
+        self._poll_after_id = None
         try:
-            while True:
-                event = self._ui_queue.get_nowait()
-                kind = event[0]
-                if kind == "progress":
-                    pct, msg = event[1], event[2]
-                    self.progress.configure(value=pct)
-                    self._set_status(msg, is_error=False)
-                elif kind == "log":
-                    self._append_log(str(event[1]))
-                elif kind == "scan_done":
-                    statuses, msg = event[1], event[2]
-                    self._statuses = statuses
-                    self._set_busy(False)
-                    self.progress.configure(value=100)
-                    self._refresh_tree()
-                    self._set_status(msg, is_error=False)
-                    self._append_log(msg)
-                elif kind == "search_done":
-                    candidates, query = event[1], event[2]
-                    self._set_busy(False)
-                    self.progress.configure(value=100)
-                    msg = f"在线搜索 '{query}' 完成：找到 {len(candidates)} 条候选补丁。"
-                    self._set_status(msg, is_error=False)
-                    self._append_log(msg)
-                    self._show_online_candidates_dialog(query, candidates)
-                elif kind == "success":
-                    msg, rescan = event[1], event[2]
-                    self.progress.configure(value=100)
-                    self._set_busy(False)
-                    self._set_status(msg, is_error=False)
-                    self._append_log(msg)
-                    messagebox.showinfo("操作完成", msg)
-                    if rescan:
-                        self.scan_games_async()
-                elif kind == "warning":
-                    title, msg = event[1], event[2]
-                    self._set_busy(False)
-                    self._set_status(f"提示: {msg.splitlines()[0]}", is_error=True)
-                    self._append_log(f"警告: {msg}")
-                    messagebox.showwarning(title, msg)
-                elif kind == "error":
-                    err_msg = str(event[1])
-                    self._set_busy(False)
-                    summary = err_msg.splitlines()[0] if err_msg else "未知错误"
-                    self._set_status(f"错误: {summary}", is_error=True)
-                    self._append_log(f"错误: {err_msg}")
-                    messagebox.showerror("操作失败", err_msg)
-        except queue.Empty:
-            pass
+            while not self._closing:
+                try:
+                    event = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                kind = None
+                try:
+                    kind = event[0]
+                    self._handle_queue_event(kind, event)
+                except Exception:
+                    logger.exception("处理后台界面事件失败，事件类型=%r", kind)
+                    if not self._closing:
+                        try:
+                            self._set_status("界面更新失败，详情见 GUI 日志。", is_error=True)
+                        except Exception:
+                            logger.exception("无法显示后台界面事件的错误提示")
         finally:
-            if self.root.winfo_exists():
-                self.root.after(100, self._poll_queue)
+            if not self._closing:
+                try:
+                    if self.root.winfo_exists():
+                        self._poll_after_id = self.root.after(100, self._poll_queue)
+                except tk.TclError:
+                    logger.debug("Tk 窗口已不可用，停止后台队列轮询", exc_info=True)
+
+    def _handle_queue_event(self, kind: str, event: tuple[Any, ...]) -> None:
+        if kind in ("scan_done", "search_done", "success", "warning", "error"):
+            self._set_busy(False)
+
+        if kind == "progress":
+            pct, msg = event[1], event[2]
+            self.progress.configure(value=pct)
+            self._set_status(msg, is_error=False)
+        elif kind == "log":
+            self._append_log(str(event[1]))
+        elif kind == "scan_done":
+            statuses, msg = event[1], event[2]
+            self._statuses = statuses
+            self.progress.configure(value=100)
+            self._refresh_tree()
+            self._set_status(msg, is_error=False)
+            self._append_log(msg)
+        elif kind == "search_done":
+            candidates, query = event[1], event[2]
+            self.progress.configure(value=100)
+            msg = f"在线搜索 '{query}' 完成：找到 {len(candidates)} 条候选补丁。"
+            self._set_status(msg, is_error=False)
+            self._append_log(msg)
+            self._show_online_candidates_dialog(query, candidates)
+        elif kind == "success":
+            msg, rescan = event[1], event[2]
+            self.progress.configure(value=100)
+            self._set_status(msg, is_error=False)
+            self._append_log(msg)
+            messagebox.showinfo("操作完成", msg)
+            if rescan and not self._closing:
+                self.scan_games_async()
+        elif kind == "warning":
+            title, msg = event[1], event[2]
+            self._set_status(f"提示: {msg.splitlines()[0]}", is_error=True)
+            self._append_log(f"警告: {msg}")
+            messagebox.showwarning(title, msg)
+        elif kind == "error":
+            err_msg = str(event[1])
+            summary = err_msg.splitlines()[0] if err_msg else "未知错误"
+            self._set_status(f"错误: {summary}", is_error=True)
+            self._append_log(f"错误: {err_msg}")
+            messagebox.showerror("操作失败", err_msg)
+        else:
+            logger.warning("忽略未知的后台界面事件类型 %r", kind)
 
     def _on_search_key_release(self, _event: object) -> None:
         """顶部搜索框 200ms 防抖实时过滤（P3-1 #2）。"""

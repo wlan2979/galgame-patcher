@@ -7,6 +7,7 @@ import http.server
 import io
 import json
 import os
+import queue
 import shutil
 import struct
 import subprocess
@@ -18,6 +19,7 @@ import zipfile
 import zlib
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from galgame_patcher import (
     GalgamePatcher,
@@ -378,6 +380,57 @@ class TestV020Features(unittest.TestCase):
                 os.environ.pop("GALGAME_PATCHER_APPDATA", None)
             else:
                 os.environ["GALGAME_PATCHER_APPDATA"] = old_env
+
+    def test_gui_poll_queue_continues_after_event_errors(self) -> None:
+        try:
+            from galgame_patcher import gui
+        except ImportError:
+            self.skipTest("当前 Python 未包含 tkinter，跳过 GUI 测试")
+
+        app = gui.GalgamePatcherGUI.__new__(gui.GalgamePatcherGUI)
+        app._closing = False
+        app._ui_queue = queue.Queue()
+        app.root = mock.Mock()
+        app.root.winfo_exists.return_value = True
+        app.root.after.return_value = "after#queue"
+        app.progress = mock.Mock()
+        app.progress.configure.side_effect = RuntimeError("测试进度控件异常")
+        app._set_status = mock.Mock(side_effect=[RuntimeError("测试状态控件异常"), None])
+        app._set_busy = mock.Mock()
+        app._append_log = mock.Mock()
+        app._ui_queue.put(("progress", 20, "正在工作"))
+        app._ui_queue.put(("success",))
+        app._ui_queue.put(("log", "后续事件"))
+
+        with self.assertLogs("galgame_patcher", level="ERROR") as logs:
+            app._poll_queue()
+
+        self.assertIn("测试进度控件异常", "\n".join(logs.output))
+        self.assertIn("测试状态控件异常", "\n".join(logs.output))
+        self.assertIn("事件类型='success'", "\n".join(logs.output))
+        app._set_busy.assert_called_once_with(False)
+        app._append_log.assert_called_once_with("后续事件")
+        app.root.after.assert_called_once_with(100, app._poll_queue)
+        self.assertEqual(app._poll_after_id, "after#queue")
+
+    def test_gui_close_cancels_pending_queue_poll(self) -> None:
+        try:
+            from galgame_patcher import gui
+        except ImportError:
+            self.skipTest("当前 Python 未包含 tkinter，跳过 GUI 测试")
+
+        app = gui.GalgamePatcherGUI.__new__(gui.GalgamePatcherGUI)
+        app.root = mock.Mock()
+        app._poll_after_id = "after#queue"
+        app._active_thread = None
+        app._save_gui_config = mock.Mock()
+
+        app._on_close()
+        app._poll_queue()
+
+        app.root.after_cancel.assert_called_once_with("after#queue")
+        app.root.destroy.assert_called_once_with()
+        app.root.after.assert_not_called()
 
     def test_package_and_cli_work_without_tkinter(self) -> None:
         """回归测试：屏蔽 tkinter 后，import 包与 CLI 均不应失败。"""
