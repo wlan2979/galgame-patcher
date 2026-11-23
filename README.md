@@ -12,20 +12,25 @@
 > - 请勿在清单中收录指向盗版资源或未经授权分发内容的链接，本仓库也不接受此类清单或 PR。
 > - 修改游戏文件可能违反部分游戏的用户协议，后果由使用者自行承担。
 
-## 核心特性
+## 核心特性 (v0.3.0)
 
-- **自动扫描本机 Galgame & 按清单下载补丁**：
-  - 读取 Windows 注册表与 Steam `libraryfolders.vdf` / `appmanifest_<appid>.acf`，自动扫描本机所有硬盘 Steam 库中已安装的游戏及补丁状态。
-  - 支持加载你自己维护的本地/远程 JSON 补丁源清单（`PatchCatalog`），从 URL 流式下载补丁、本地缓存复用并校验 SHA256。
+- **事务化安装与安全回滚（零毁档保护）**：
+  - 安装过程每备份/覆盖一个文件即原子写入 `manifest.json` (`in_progress` → `committed`)；中途遇到任何异常（权限不足、磁盘满、写入后 SHA256 校验失败等）会**自动回滚本轮全部变更**，并将残留进度恢复逻辑集成在 `rollback()` 中。
+  - 安装前前置检测目标文件是否被运行中的游戏占用（抛出 `GameRunningError`，支持 `--force-locked` 跳过）；通过 `.galpatch_backup/.lock` 排他锁防止多实例并发破坏（自动清理已退出进程的陈旧锁）。
+  - 回滚失败时保留 `.galpatch_backup` 副本与失败原因详情，不到全部确认成功绝不删除备份。
+  - 支持 `--dry-run` 仅预览模式，不写盘即可查看将覆盖/新增的文件清单。
+- **支持 Steam + 手工登记 + 非 Steam 深度扫描**：
+  - 自动读取 Windows 注册表与 Steam `libraryfolders.vdf` / `appmanifest_<appid>.acf`。
+  - 支持 `galpatch add-game <path>` 将 DMM / DLsite / 实体盘等非 Steam 游戏登记到 `%APPDATA%\galgame-patcher\games.json`；支持 `--deep` 深度扫描常见目录中的特征 Galgame 文件夹。
+- **清单管理与在线补丁自动爬取**：
+  - 支持加载本地/远程 JSON 清单，提供 `galpatch catalog update / list / verify` 进行版本化增量合并（保留 `.bak`）与 `HEAD` 链接探活。
+  - 提供 `galpatch search <游戏名或网页URL>`（及 GUI 内置搜索按钮），自动从公开补丁数据库 (VNDB API v2)、GitHub Releases 或指定补丁发布网页提取候选链接与直链。
 - **桌面图形界面 (GUI) & 单文件 `.exe`**：
-  - 内置基于标准库 `tkinter` 的桌面窗口（执行 `galpatch gui` 或直接双击 Release 中提供的 `galgame-patcher-windows-x64.exe`）。
-  - 无需安装 Python 或命令行操作，点选扫描到的游戏即可一键打补丁或还原备份。
+  - 左右分栏布局（左侧库列表 + 右侧详情/操作/日志面板），带 200ms 防抖搜索、后台队列异步进度与速度显示、`Ctrl+V` 剪贴板粘贴路径、窗口与目录记忆、`%APPDATA%\galgame-patcher\logs\gui.log` 日志落盘及危险操作二次确认。
+  - 执行 `galpatch gui` 或直接双击 Release 中提供的 `galgame-patcher-windows-x64.exe` 即可使用。
 - **多格式解压**：
-  - 支持单文件补丁（`.xp3`、`.arc`、`.pck`、`.pac`、`.ypf`、`.rpa` 等）、补丁文件夹以及 `.zip`、`.7z`、`.rar`、`.tar` / `.tar.gz` / `.tgz` / `.tar.bz2` / `.tar.xz` 压缩包。
-  - 自动剥离单层顶层套壳目录，内置 Zip Slip 路径穿越防护。
+  - 支持单文件补丁（`.xp3`、`.arc`、`.pck`、`.pac`、`.ypf`、`.rpa` 等）、补丁文件夹以及 `.zip`、`.7z`、`.rar`、`.tar*` 压缩包，全格式在写盘前完成路径穿越校验，外部命令禁用 stdin 并带 300s 超时防假死。
   - 加密压缩包需由用户提供密码（`--password` / `--try-password` / GUI 输入框 / 清单 `archive_password`），**程序不内置任何密码字典，也不会自动猜测密码**。
-- **安全备份与一键回滚**：
-  - 打补丁前自动将即将被覆盖的原文件备份至 `<游戏目录>/.galpatch_backup/` 并记录新增文件清单，支持随时一键还原至未打补丁前的纯净状态。
 
 ## 支持的常见 Galgame 引擎补丁格式
 
@@ -67,25 +72,40 @@ galgame-patcher-gui
 ### 2. 命令行用法 (`galpatch` / `galgame-patcher`)
 
 ```bash
-# 1) 扫描本机已安装的清单 Galgame 及当前补丁状态
-galpatch scan --only-installed
+# 1) 扫描本机已安装的清单游戏（含手工登记目录与深度扫描非 Steam 目录）
+galpatch scan --only-installed --include-manual --deep
 
-# 2) 使用自定义清单自动定位游戏、下载并安装补丁
+# 2) 手工登记非 Steam 游戏目录（自动推断目录名和最大 .exe）
+galpatch add-game "D:\Games\MyDlsiteGame"
+
+# 3) 自动上网搜索公开补丁信息 (VNDB / GitHub Releases / 指定网页)
+galpatch search "Game Title"
+galpatch search "https://example.com/patch-release-page.html"
+
+# 4) 清单远程更新、列表查看与链接探活
+galpatch catalog update https://example.com/catalog.json
+galpatch catalog list
+galpatch catalog verify
+
+# 5) 仅预览将修改的文件（Dry-Run，不写盘）
+galpatch apply ./patch.zip --game-name "MyGame" --dry-run
+
+# 6) 使用自定义清单自动定位游戏、下载并安装补丁
 galpatch auto my_game --catalog ./my_catalog.json
 
-# 3) 直接传入远程 URL 或加密 .7z / .zip 安装补丁（加密包需提供密码）
+# 7) 直接传入远程 URL 或加密 .7z / .zip 安装补丁（加密包需提供密码；--force-locked 可跳过占用检查）
 galpatch apply https://example.com/official_update.7z --app-id 123456 --password <密码>
 
-# 4) 不确定是哪个密码时，可多次传入候选密码（仅尝试你提供的这些）
+# 8) 不确定是哪个密码时，可多次传入候选密码（仅尝试你提供的这些）
 galpatch apply ./patch.zip --game-name "MyGame" --try-password pw1 --try-password pw2
 
-# 5) 仅查找并打印游戏安装路径
+# 9) 仅查找并打印游戏安装路径
 galpatch locate --app-id 123456
 
-# 6) 计算补丁文件的 SHA256 值
+# 10) 计算补丁文件的 SHA256 值
 galpatch hash ./patch.zip
 
-# 7) 一键卸载补丁并恢复游戏目录
+# 11) 一键卸载补丁并恢复游戏目录
 galpatch rollback "D:\SteamLibrary\steamapps\common\MyGame"
 ```
 

@@ -1,19 +1,38 @@
-"""galgame-patcher：一键定位并给对应 Galgame 自动打补丁的 Python 库与桌面工具。"""
+"""galgame-patcher：一键定位、自动爬取并给对应 Galgame 安装/还原补丁的 Python 库与桌面工具。"""
 
 from __future__ import annotations
 
-from .archive import extract_archive, is_supported_archive
 from ._version import __version__
+from .archive import extract_archive, is_supported_archive
 from .catalog import PatchCatalog
-from .downloader import download_patch
-from .locator import SteamLocator, locate_game
+from .downloader import (
+    check_url_head,
+    crawl_github_patch_releases,
+    crawl_vndb_patches,
+    discover_patches_online,
+    download_patch,
+    scrape_patch_links_from_page,
+)
+from .locator import (
+    ManualLocator,
+    SteamLocator,
+    deep_scan_games,
+    is_likely_galgame_dir,
+    iter_deep_scan_candidates,
+    locate_game,
+)
 from .models import (
     COMMON_ARCHIVE_EXTENSIONS,
     COMMON_PATCH_EXTENSIONS,
+    GALGAME_ARCHIVE_INDICATORS,
     CatalogEntry,
+    ConcurrencyError,
     GameProfile,
+    GameRunningError,
     InstalledGameStatus,
+    OnlinePatchCandidate,
     PatchResult,
+    get_appdata_dir,
 )
 from .patcher import GalgamePatcher, apply_patch, compute_sha256, rollback_patch
 
@@ -24,15 +43,25 @@ def launch_gui() -> int:
 
     return _launch_gui()
 
+
 __all__ = [
     "__version__",
     "COMMON_PATCH_EXTENSIONS",
+    "GALGAME_ARCHIVE_INDICATORS",
     "COMMON_ARCHIVE_EXTENSIONS",
+    "GameRunningError",
+    "ConcurrencyError",
     "GameProfile",
     "PatchResult",
     "CatalogEntry",
     "InstalledGameStatus",
+    "OnlinePatchCandidate",
+    "get_appdata_dir",
+    "ManualLocator",
     "SteamLocator",
+    "is_likely_galgame_dir",
+    "iter_deep_scan_candidates",
+    "deep_scan_games",
     "PatchCatalog",
     "GalgamePatcher",
     "locate_game",
@@ -40,6 +69,11 @@ __all__ = [
     "rollback_patch",
     "compute_sha256",
     "download_patch",
+    "check_url_head",
+    "discover_patches_online",
+    "crawl_vndb_patches",
+    "crawl_github_patch_releases",
+    "scrape_patch_links_from_page",
     "extract_archive",
     "is_supported_archive",
     "launch_gui",

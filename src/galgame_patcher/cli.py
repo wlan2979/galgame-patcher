@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .catalog import PatchCatalog
-from .locator import SteamLocator
+from .downloader import discover_patches_online
+from .locator import ManualLocator, SteamLocator
+from .models import ConcurrencyError, GameRunningError
 from .patcher import GalgamePatcher, compute_sha256
 
 
@@ -16,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         prog="galgame-patcher",
-        description="一键定位并给对应 Galgame 自动打补丁的命令行与桌面工具",
+        description="一键定位、自动爬取并给对应 Galgame 安装/还原补丁的命令行与桌面工具",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -50,10 +52,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="解压压缩包时不剥离单层顶层套壳目录",
     )
+    apply_parser.add_argument(
+        "--force-locked",
+        action="store_true",
+        help="跳过目标文件被占用检查（P0-2）",
+    )
+    apply_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="仅预览将覆盖或新增的文件列表，不实际写入磁盘（P3-2）",
+    )
 
     # scan 子命令
     scan_parser = subparsers.add_parser(
-        "scan", help="扫描本机已安装的清单 Galgame 与补丁状态"
+        "scan", help="扫描本机已安装的清单 Galgame、手工登记游戏与非 Steam 游戏"
     )
     scan_parser.add_argument("--catalog", help="自定义清单 JSON 文件路径或远程 URL")
     scan_parser.add_argument(
@@ -61,7 +73,56 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="仅显示本机已检测到的已安装游戏",
     )
+    scan_parser.add_argument(
+        "--include-manual",
+        action="store_true",
+        help="包含通过 add-game 手工登记的游戏目录（P2-1）",
+    )
+    scan_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="深度扫描非 Steam 常见安装位置（P2-1）",
+    )
+    scan_parser.add_argument(
+        "--deep-root",
+        dest="deep_roots",
+        action="append",
+        help="指定深度扫描根目录（可多次指定，默认 C:/D:/E:）",
+    )
     scan_parser.add_argument("--steam-root", help="自定义 Steam 根目录路径")
+
+    # add-game 子命令（P2-1）
+    add_game_parser = subparsers.add_parser(
+        "add-game", help="将非 Steam 游戏目录手工登记到本地配置库"
+    )
+    add_game_parser.add_argument("path", help="游戏安装根目录路径")
+    add_game_parser.add_argument("--name", help="自定义游戏名称（默认取目录名）")
+    add_game_parser.add_argument(
+        "--executable", help="主程序文件名（默认取目录下体积最大的 .exe）"
+    )
+
+    # catalog 子命令（P2-2: update / list / verify）
+    catalog_parser = subparsers.add_parser(
+        "catalog", help="管理补丁源清单（远程更新、列表查看、链接探活）"
+    )
+    catalog_sub = catalog_parser.add_subparsers(
+        dest="catalog_action", required=True
+    )
+    cat_update = catalog_sub.add_parser("update", help="从远程 URL 拉取并增量合并更新清单")
+    cat_update.add_argument("url", help="远程清单 JSON URL")
+    cat_update.add_argument("--catalog", help="要更新的本地清单文件路径（默认 %APPDATA%）")
+
+    cat_list = catalog_sub.add_parser("list", help="列出清单中的所有游戏条目")
+    cat_list.add_argument("--catalog", help="清单文件路径或远程 URL")
+
+    cat_verify = catalog_sub.add_parser("verify", help="对清单中的每个补丁链接发起 HEAD 请求探活")
+    cat_verify.add_argument("--catalog", help="清单文件路径或远程 URL")
+
+    # search 子命令（自动去公开补丁站爬取）
+    search_parser = subparsers.add_parser(
+        "search", help="自动从 VNDB / GitHub Releases / 指定网页爬取对应游戏的补丁链接"
+    )
+    search_parser.add_argument("query", help="游戏名称（英文/日文/中文）或要爬取的补丁网页 URL")
 
     # auto 子命令
     auto_parser = subparsers.add_parser(
@@ -77,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="覆盖文件前不进行自动备份",
     )
+    auto_parser.add_argument(
+        "--force-locked",
+        action="store_true",
+        help="跳过目标文件被占用检查",
+    )
+    auto_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="仅预览变更而不实际写入磁盘",
+    )
 
     # gui 子命令
     subparsers.add_parser("gui", help="启动可视化桌面图形界面")
@@ -86,6 +157,9 @@ def build_parser() -> argparse.ArgumentParser:
     locate_parser.add_argument("--app-id", type=int, help="Steam AppID")
     locate_parser.add_argument("--game-name", help="游戏目录或名称")
     locate_parser.add_argument("--steam-root", help="自定义 Steam 根目录路径")
+    locate_parser.add_argument(
+        "--deep", action="store_true", help="启用深度扫描定位非 Steam 游戏"
+    )
 
     # rollback 子命令
     rollback_parser = subparsers.add_parser("rollback", help="从备份一键还原游戏目录")
@@ -143,19 +217,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 strip_single_top_dir=not args.no_strip,
                 password=args.password,
                 password_candidates=args.password_candidates,
+                force_locked=args.force_locked,
+                dry_run=args.dry_run,
             )
             print(result.message)
             print(f"游戏目录: {result.game_dir}")
             if result.backup_dir:
                 print(f"备份目录: {result.backup_dir}")
-            return 0
+            return 0 if result.success else 1
 
         if args.command == "scan":
             catalog = PatchCatalog.load(args.catalog)
-            locator = SteamLocator(steam_root=args.steam_root)
+            locator = SteamLocator(
+                steam_root=args.steam_root,
+                deep_scan=args.deep,
+                deep_scan_roots=args.deep_roots,
+            )
             statuses = catalog.scan_games(
                 locator=locator,
                 only_installed=args.only_installed,
+                include_manual=args.include_manual,
+                deep_scan=args.deep,
+                deep_scan_roots=args.deep_roots,
             )
             if not statuses:
                 print("未扫描到符合条件的游戏。")
@@ -175,6 +258,68 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             return 0
 
+        if args.command == "add-game":
+            manual = ManualLocator()
+            reg = manual.add_game(
+                args.path,
+                name=args.name,
+                executable=args.executable,
+            )
+            print(
+                f"已登记游戏: {reg['name']} "
+                f"(可执行文件: {reg.get('executable') or '无'}) -> {reg['dir']}"
+            )
+            return 0
+
+        if args.command == "catalog":
+            catalog = PatchCatalog.load(getattr(args, "catalog", None))
+            if args.catalog_action == "list":
+                print(f"清单版本: v{catalog.version} (共 {len(catalog.entries)} 条)")
+                for e in catalog.entries:
+                    print(
+                        f"- {e.id}: {e.name} (v{e.patch_version}, "
+                        f"source={e.source}, last_verified={e.last_verified or '-'}) -> {e.patch_url or '未配置URL'}"
+                    )
+                return 0
+
+            if args.catalog_action == "update":
+                updated = catalog.update_from_remote(
+                    args.url,
+                    target_path=args.catalog,
+                )
+                if updated:
+                    print(
+                        f"清单已更新至 v{catalog.version}（共 {len(catalog.entries)} 个条目）。"
+                    )
+                else:
+                    print(f"本地清单已是最新版本 (v{catalog.version})，无需更新。")
+                return 0
+
+            if args.catalog_action == "verify":
+                report = catalog.verify_links()
+                if args.catalog:
+                    catalog.save_to_file(args.catalog)
+                all_ok = True
+                for entry_id, (ok, detail) in report.items():
+                    mark = "有效" if ok else "失效"
+                    if not ok:
+                        all_ok = False
+                    print(f"[{mark}] {entry_id}: {detail}")
+                return 0 if all_ok else 1
+
+        if args.command == "search":
+            candidates = discover_patches_online(args.query)
+            if not candidates:
+                print(f"未搜索到与 {args.query!r} 相关的在线补丁。")
+                return 0
+            print(f"共找到 {len(candidates)} 条补丁候选：")
+            for idx, cand in enumerate(candidates, start=1):
+                kind = "直链包" if cand.is_direct_download else "发布页"
+                lang = f" [{cand.language}]" if cand.language else ""
+                print(f"{idx}. [{kind} | {cand.source_site}]{lang} {cand.title}")
+                print(f"   URL: {cand.url}")
+            return 0
+
         if args.command == "auto":
             catalog = PatchCatalog.load(args.catalog)
             locator = SteamLocator(steam_root=args.steam_root)
@@ -185,19 +330,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 game_dir=args.game_dir,
                 backup=not args.no_backup,
                 password=args.password,
+                force_locked=args.force_locked,
+                dry_run=args.dry_run,
             )
             print(result.message)
             print(f"游戏目录: {result.game_dir}")
             if result.backup_dir:
                 print(f"备份目录: {result.backup_dir}")
-            return 0
+            return 0 if result.success else 1
 
         if args.command == "locate":
             if args.app_id is None and not args.game_name:
                 parser.error("请至少提供 --app-id 或 --game-name 之一")
 
-            locator = SteamLocator(steam_root=args.steam_root)
-            found_dir = locator.locate(app_id=args.app_id, game_name=args.game_name)
+            locator = SteamLocator(
+                steam_root=args.steam_root,
+                deep_scan=args.deep,
+            )
+            found_dir = locator.locate(
+                app_id=args.app_id,
+                game_name=args.game_name,
+                deep_scan=args.deep,
+            )
             print(found_dir)
             return 0
 
@@ -205,12 +359,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             patcher = GalgamePatcher()
             result = patcher.rollback(Path(args.game_dir))
             print(result.message)
-            return 0
+            return 0 if result.success else 1
 
         if args.command == "hash":
             print(compute_sha256(args.file))
             return 0
 
+    except GameRunningError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    except ConcurrencyError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1

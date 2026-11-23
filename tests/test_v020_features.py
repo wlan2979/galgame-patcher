@@ -343,19 +343,41 @@ class TestV020Features(unittest.TestCase):
         except ImportError:
             self.skipTest("当前 Python 未包含 tkinter，跳过 GUI 测试")
 
+        import gc
+        import logging
         from galgame_patcher import gui
 
         self.assertTrue(callable(gui.launch_gui))
+        old_env = os.environ.get("GALGAME_PATCHER_APPDATA")
+        os.environ["GALGAME_PATCHER_APPDATA"] = str(self.root / "gui_appdata")
         try:
-            root = tk.Tk()
-        except tk.TclError as exc:
-            self.skipTest(f"无图形显示环境，跳过 Tk 窗口测试: {exc}")
-        try:
-            root.withdraw()
-            app = gui.GalgamePatcherGUI(root)
-            self.assertIsNotNone(app.tree)
+            try:
+                root = tk.Tk()
+            except tk.TclError as exc:
+                self.skipTest(f"无图形显示环境，跳过 Tk 窗口测试: {exc}")
+            app = None
+            try:
+                root.withdraw()
+                app = gui.GalgamePatcherGUI(root)
+                self.assertIsNotNone(app.tree)
+            finally:
+                if app is not None:
+                    app._on_close()
+                elif root.winfo_exists():
+                    root.destroy()
+                del app
+                del root
+                gc.collect()
+                logger = logging.getLogger("galgame_patcher")
+                for h in list(logger.handlers):
+                    if isinstance(h, logging.FileHandler):
+                        h.close()
+                        logger.removeHandler(h)
         finally:
-            root.destroy()
+            if old_env is None:
+                os.environ.pop("GALGAME_PATCHER_APPDATA", None)
+            else:
+                os.environ["GALGAME_PATCHER_APPDATA"] = old_env
 
     def test_package_and_cli_work_without_tkinter(self) -> None:
         """回归测试：屏蔽 tkinter 后，import 包与 CLI 均不应失败。"""

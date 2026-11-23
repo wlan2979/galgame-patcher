@@ -1,58 +1,103 @@
-"""游戏补丁源清单（PatchCatalog）与本机已安装 Galgame 自动扫描。"""
+"""游戏补丁源清单（PatchCatalog）、远程版本化更新、链接探活与本机游戏自动扫描（P2-2）。"""
 
 from __future__ import annotations
 
 import json
-import urllib.request
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-from ._version import __version__
-from .locator import SteamLocator
-from .models import CatalogEntry, InstalledGameStatus
+from .downloader import check_url_head, discover_patches_online, fetch_json
+from .locator import ManualLocator, SteamLocator, deep_scan_games
+from .models import (
+    CatalogEntry,
+    InstalledGameStatus,
+    OnlinePatchCandidate,
+    get_appdata_dir,
+)
 
 # 内置清单仅提供一个格式示例，不收录任何具体作品或补丁链接。
-# 请通过 PatchCatalog.load(<本地 JSON 路径或 URL>) 加载你自己维护的清单，
-# 且只收录官方发布或已获授权的补丁。
 DEFAULT_CATALOG_ENTRIES: list[dict[str, Any]] = [
     {
         "id": "example_game",
-        "name": "示例游戏（请导入你自己的清单）",
+        "name": "示例游戏（请导入清单或使用自动搜索）",
         "steam_app_id": None,
         "install_dir_name": "ExampleGame",
         "executable_name": "Game.exe",
         "patch_url": "",
         "patch_version": "1.0",
         "description": "格式示例条目。请只填写官方发布或已获授权的补丁链接。",
+        "last_verified": "",
+        "source": "builtin",
     },
 ]
 
 
-class PatchCatalog:
-    """管理游戏补丁源清单并自动扫描本地已安装的 Steam Galgame。"""
+def _is_game_patched(game_dir: Path) -> bool:
+    """检查游戏目录是否存在有效（非 rolled_back）的补丁备份清单。"""
+    manifest_path = game_dir / ".galpatch_backup" / "manifest.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return data.get("status") != "rolled_back"
+    except (OSError, json.JSONDecodeError):
+        return True
 
-    def __init__(self, entries: Optional[Sequence[CatalogEntry]] = None) -> None:
+
+class PatchCatalog:
+    """管理游戏补丁源清单、远程增量合并更新、链接校验及本机已安装游戏扫描。"""
+
+    def __init__(
+        self,
+        entries: Optional[Sequence[CatalogEntry]] = None,
+        *,
+        version: int = 1,
+    ) -> None:
         self.entries: list[CatalogEntry] = list(entries or ())
+        self.version: int = int(version)
+
+    @staticmethod
+    def default_storage_path() -> Path:
+        """返回 %APPDATA%\\galgame-patcher\\catalog.json 默认持久化路径。"""
+        return get_appdata_dir() / "catalog.json"
 
     @classmethod
     def default(cls) -> PatchCatalog:
-        """加载内置默认游戏补丁配置模板清单。"""
-        return cls.from_dict(DEFAULT_CATALOG_ENTRIES)
+        """加载用户本地已更新的持久化清单，若不存在则加载内置默认清单模板。"""
+        storage = cls.default_storage_path()
+        if storage.is_file():
+            try:
+                return cls.from_file(storage)
+            except Exception:
+                pass
+        return cls.from_dict({"version": 1, "games": DEFAULT_CATALOG_ENTRIES}, default_source="builtin")
 
     @classmethod
     def from_dict(
-        cls, data: Union[dict[str, Any], list[dict[str, Any]]]
+        cls,
+        data: Union[dict[str, Any], list[dict[str, Any]]],
+        *,
+        default_source: str = "builtin",
     ) -> PatchCatalog:
         """从 JSON 解析出的字典或列表构造清单。"""
+        version = 1
         if isinstance(data, dict):
+            raw_version = data.get("version")
+            if raw_version is not None:
+                version = int(raw_version)
             raw_entries = data.get("games") or data.get("entries") or []
         elif isinstance(data, list):
             raw_entries = data
         else:
             raise ValueError("清单 JSON 格式无效，应为对象或条目列表")
 
-        entries = [CatalogEntry.from_dict(item) for item in raw_entries]
-        return cls(entries=entries)
+        entries = [
+            CatalogEntry.from_dict(item, default_source=default_source)
+            for item in raw_entries
+        ]
+        return cls(entries=entries, version=version)
 
     @classmethod
     def from_file(cls, path: Union[str, Path]) -> PatchCatalog:
@@ -61,23 +106,17 @@ class PatchCatalog:
         if not file_path.is_file():
             raise FileNotFoundError(f"清单文件不存在: {file_path}")
         data = json.loads(file_path.read_text(encoding="utf-8"))
-        return cls.from_dict(data)
+        return cls.from_dict(data, default_source=str(file_path))
 
     @classmethod
     def from_url(cls, url: str, timeout: float = 15.0) -> PatchCatalog:
-        """从远程 HTTP/HTTPS/FILE URL 加载清单 JSON。"""
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": f"galgame-patcher/{__version__}"},
-        )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw_text = response.read().decode("utf-8")
-        data = json.loads(raw_text)
-        return cls.from_dict(data)
+        """通过 downloader.py 的统一网络配置从远程 URL 加载清单 JSON（P2-2）。"""
+        data = fetch_json(url, timeout=timeout)
+        return cls.from_dict(data, default_source=url)
 
     @classmethod
     def load(cls, source: Optional[Union[str, Path]] = None) -> PatchCatalog:
-        """根据路径或 URL 自动加载清单，未指定时返回默认内置清单。"""
+        """根据路径或 URL 自动加载清单，未指定时返回默认清单。"""
         if source is None or str(source).strip() == "":
             return cls.default()
         source_str = str(source).strip()
@@ -85,17 +124,112 @@ class PatchCatalog:
             return cls.from_url(source_str)
         return cls.from_file(source_str)
 
-    def save_to_file(self, path: Union[str, Path]) -> None:
-        """将当前清单保存为 JSON 文件（可用于生成/编辑自定义清单）。"""
-        target = Path(path)
+    def save_to_file(self, path: Optional[Union[str, Path]] = None) -> Path:
+        """将当前清单保存为 JSON 文件。"""
+        target = Path(path) if path is not None else self.default_storage_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": self.version,
             "games": [entry.to_dict() for entry in self.entries],
         }
         target.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
+        )
+        return target
+
+    def update_from_remote(
+        self,
+        url: str,
+        *,
+        target_path: Optional[Union[str, Path]] = None,
+        timeout: float = 15.0,
+    ) -> bool:
+        """从远程 URL 拉取新版清单并增量合并到本地 catalog.json，保留 .bak 备份（P2-2）。
+
+        - 校验远程 version 字段比当前 version 新才执行覆盖合并
+        - 合并策略：同 id 的条目以远程为准，本地独有条目保留
+        - 写入 %APPDATA%\\galgame-patcher\\catalog.json，并将合并前版本备份为 catalog.json.bak
+        """
+        remote_catalog = self.from_url(url, timeout=timeout)
+        if remote_catalog.version <= self.version:
+            return False
+
+        storage_path = (
+            Path(target_path)
+            if target_path is not None
+            else self.default_storage_path()
+        )
+        storage_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 保存合并前的版本到 catalog.json.bak
+        bak_path = storage_path.with_name(storage_path.name + ".bak")
+        if storage_path.is_file():
+            shutil.copy2(storage_path, bak_path)
+        else:
+            self.save_to_file(bak_path)
+
+        remote_by_id: dict[str, CatalogEntry] = {}
+        for entry in remote_catalog.entries:
+            entry.source = url
+            remote_by_id[entry.id] = entry
+
+        merged: list[CatalogEntry] = []
+        seen_ids: set[str] = set()
+
+        # 保留现有顺序中的条目（若远程有同 id 则替换为远程版本，否则保留本地独有条目）
+        for local_entry in self.entries:
+            if local_entry.id in remote_by_id:
+                merged.append(remote_by_id[local_entry.id])
+                seen_ids.add(local_entry.id)
+            else:
+                merged.append(local_entry)
+                seen_ids.add(local_entry.id)
+
+        # 追加远程新增条目
+        for remote_entry in remote_catalog.entries:
+            if remote_entry.id not in seen_ids:
+                merged.append(remote_entry)
+                seen_ids.add(remote_entry.id)
+
+        self.entries = merged
+        self.version = remote_catalog.version
+        self.save_to_file(storage_path)
+        return True
+
+    def verify_links(
+        self, *, timeout: float = 10.0
+    ) -> dict[str, tuple[bool, str]]:
+        """对清单中的每个条目发起 HEAD 请求探活，更新 last_verified 并标记失效链接（P2-2）。"""
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        report: dict[str, tuple[bool, str]] = {}
+        for entry in self.entries:
+            if not entry.patch_url or not entry.patch_url.strip():
+                report[entry.id] = (False, "未配置补丁链接")
+                continue
+            ok, detail = check_url_head(entry.patch_url, timeout=timeout)
+            if ok:
+                entry.last_verified = today_iso
+            report[entry.id] = (ok, detail)
+        return report
+
+    def search_online_for_entry(
+        self,
+        entry_or_query: Union[CatalogEntry, str, int],
+        *,
+        extra_page_urls: Optional[Sequence[str]] = None,
+        timeout: float = 12.0,
+    ) -> list[OnlinePatchCandidate]:
+        """自动在公开补丁库（VNDB / GitHub Releases / 指定网页）爬取对应游戏的补丁链接。"""
+        if isinstance(entry_or_query, CatalogEntry):
+            query = entry_or_query.install_dir_name or entry_or_query.name
+        else:
+            found = self.find_entry(entry_or_query)
+            query = (found.install_dir_name or found.name) if found else str(entry_or_query)
+        return discover_patches_online(
+            query,
+            extra_page_urls=extra_page_urls,
+            timeout=timeout,
         )
 
     def find_entry(self, query: Union[str, int]) -> Optional[CatalogEntry]:
@@ -136,10 +270,14 @@ class PatchCatalog:
         locator: Optional[SteamLocator] = None,
         *,
         only_installed: bool = False,
+        include_manual: bool = False,
+        deep_scan: bool = False,
+        deep_scan_roots: Optional[Sequence[Union[str, Path]]] = None,
     ) -> list[InstalledGameStatus]:
-        """扫描本机已安装的清单游戏及其当前补丁状态。"""
+        """扫描本机已安装的清单游戏、手工登记游戏以及可选的全盘非 Steam 候选游戏（P2-1）。"""
         active_locator = locator or SteamLocator()
         results: list[InstalledGameStatus] = []
+        seen_dirs: set[Path] = set()
 
         for entry in self.entries:
             game_dir: Optional[Path] = None
@@ -147,10 +285,15 @@ class PatchCatalog:
             patched = False
 
             try:
-                game_dir = active_locator.locate(entry.to_game_profile()).resolve()
+                game_dir = active_locator.locate(
+                    entry.to_game_profile(),
+                    include_manual=include_manual,
+                    deep_scan=deep_scan,
+                    deep_scan_roots=deep_scan_roots,
+                ).resolve()
                 installed = True
-                manifest_path = game_dir / ".galpatch_backup" / "manifest.json"
-                patched = manifest_path.is_file()
+                seen_dirs.add(game_dir)
+                patched = _is_game_patched(game_dir)
             except FileNotFoundError:
                 installed = False
 
@@ -165,5 +308,59 @@ class PatchCatalog:
                     patched=patched,
                 )
             )
+
+        # 追加 ManualLocator 中已登记但不在清单中的本地游戏
+        if include_manual:
+            manual_loc = active_locator.manual_locator or ManualLocator()
+            for item in manual_loc.list_games():
+                raw_dir = item.get("dir")
+                if not raw_dir:
+                    continue
+                gdir = Path(str(raw_dir))
+                if not gdir.is_dir():
+                    continue
+                resolved = gdir.resolve()
+                if resolved in seen_dirs:
+                    continue
+                seen_dirs.add(resolved)
+                gname = str(item.get("name") or resolved.name)
+                exe_name = item.get("executable")
+                patched = _is_game_patched(resolved)
+                results.append(
+                    InstalledGameStatus(
+                        entry=CatalogEntry(
+                            id=f"manual_{resolved.name.lower()}",
+                            name=gname,
+                            install_dir_name=resolved.name,
+                            executable_name=str(exe_name) if exe_name else None,
+                            source="manual",
+                        ),
+                        installed=True,
+                        game_dir=resolved,
+                        patched=patched,
+                    )
+                )
+
+        # 追加深度扫描发现的非 Steam 本地 Galgame
+        if deep_scan:
+            for candidate_dir in deep_scan_games(roots=deep_scan_roots):
+                resolved = candidate_dir.resolve()
+                if resolved in seen_dirs:
+                    continue
+                seen_dirs.add(resolved)
+                patched = _is_game_patched(resolved)
+                results.append(
+                    InstalledGameStatus(
+                        entry=CatalogEntry(
+                            id=f"deep_{resolved.name.lower()}",
+                            name=resolved.name,
+                            install_dir_name=resolved.name,
+                            source="deep_scan",
+                        ),
+                        installed=True,
+                        game_dir=resolved,
+                        patched=patched,
+                    )
+                )
 
         return results
