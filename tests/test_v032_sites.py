@@ -41,6 +41,7 @@ class TestV032Sites(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_yuzusoft_crawler_and_root_url_dispatch(self) -> None:
+        download_page = "https://www.yuzu-soft.com/products/senren/download.html"
         support_html = """
         <html><body>
           <a href="http://yuzu-soft.jp/bin/p_tenshin_savefix.zip">修正パッチ(p_tenshin_savefix.zip)</a>
@@ -51,14 +52,16 @@ class TestV032Sites(unittest.TestCase):
         senren_sup_html = """
         <html><body>
           <a href="https://yuzu-soft.jp/bin/sen_patch_1_12.zip">千恋＊万花修正パッチ</a>
-          <a href="https://www.yuzu-soft.com/products/senren/evil_tool.exe">patch tool</a>
+          <a href="bin/sen_wall.zip">壁纸</a>
+          <a href="bin/sen_sys_voice.zip">系统语音</a>
+          <a href="bin/twitter.zip">头像</a>
         </body></html>
         """
 
         def _fake_fetch_text(url: str, **kwargs: object) -> str:
             if url.endswith("/support.html"):
                 return support_html
-            if url.endswith("/senren_sup.html"):
+            if url.split("?", 1)[0].endswith(("/senren_sup.html", "/download.html")):
                 return senren_sup_html
             raise AssertionError(f"Unexpected URL: {url}")
 
@@ -67,17 +70,21 @@ class TestV032Sites(unittest.TestCase):
 
         urls = [c.url for c in cands]
         self.assertIn("https://www.yuzu-soft.com/products/senren/senren_sup.html", urls)
-        self.assertIn("https://yuzu-soft.jp/bin/sen_patch_1_12.zip", urls)
-        zip_cand = next(c for c in cands if c.url.endswith("sen_patch_1_12.zip"))
-        self.assertTrue(zip_cand.trusted)
-        self.assertTrue(zip_cand.is_direct_download)
-        self.assertFalse(zip_cand.bare_executable)
+        self.assertIn(download_page, urls)
+        self.assertFalse(any(c.is_direct_download for c in cands))
+        installer = next(c for c in cands if c.url == download_page)
+        self.assertTrue(installer.trusted)
+        self.assertTrue(installer.manual_install)
+        self.assertIn("Steam 版兼容性未确认", installer.description)
 
-        # 如果子页存在 .exe 链接，绝不会被标为 is_direct_download=True
-        exe_cands = [c for c in cands if c.url.endswith("evil_tool.exe")]
-        if exe_cands:
-            self.assertFalse(exe_cands[0].is_direct_download)
-            self.assertTrue(exe_cands[0].bare_executable)
+        with mock.patch("galgame_patcher.downloader.fetch_text", side_effect=_fake_fetch_text):
+            direct_cands = discover_patches_online(download_page + "?ref=test")
+        self.assertEqual(direct_cands, [installer])
+
+        with mock.patch("galgame_patcher.downloader.fetch_text") as mocked_fetch:
+            archive_cands = discover_patches_online("https://yuzu-soft.jp/bin/sen_patch_1_12.zip")
+        mocked_fetch.assert_not_called()
+        self.assertEqual(archive_cands, [installer])
 
         # 直接把 https://www.yuzu-soft.com 传给 discover_patches_online 应自动解析 support.html
         with mock.patch("galgame_patcher.downloader.fetch_text", side_effect=_fake_fetch_text):
@@ -87,18 +94,21 @@ class TestV032Sites(unittest.TestCase):
     def test_nekonyan_pcgamingwiki_and_07th_mod_crawlers(self) -> None:
         nn_html = """
         <html><body>
+          <a href="#aokana-extra1-18-steam-patch">Aokana Extra1 18+ Steam Patch</a>
+          <a href="#aokana-perfect-edition-18-steam-patch">Aokana Perfect Edition 18+ Steam Patch</a>
           <a href="#aokana-extra2-18-steam-patch">Aokana Extra2 18+ Steam Patch</a>
           <a href="#makinglovers-first-blush-18-steam-patch">Making*Lovers 18+ Steam Patch</a>
         </body></html>
         """
         with mock.patch("galgame_patcher.downloader.fetch_text", return_value=nn_html):
-            nn_cands = crawl_nekonyan_patches("Aokana Extra2")
+            nn_cands = crawl_nekonyan_patches("Aokana Extra 2")
         self.assertEqual(len(nn_cands), 1)
         self.assertEqual(
             nn_cands[0].url,
-            "https://nekonyansoft.com/shop/patches#aokana-extra2-18-steam-patch",
+            "https://patches.nekonyansoft.com/#aokana-extra2-18-steam-patch",
         )
         self.assertTrue(nn_cands[0].trusted)
+        self.assertIn("Steam", nn_cands[0].description)
 
         pcgw_resp = {
             "query": {
@@ -129,6 +139,7 @@ class TestV032Sites(unittest.TestCase):
         with mock.patch("galgame_patcher.downloader.fetch_json", return_value=org_repos):
             mod_cands = crawl_07th_mod_patches("Higurashi")
         self.assertTrue(any(c.url == "https://07th-mod.com/" and c.trusted for c in mod_cands))
+        self.assertFalse(any(c.official for c in mod_cands))
         self.assertTrue(
             any("higurashi-console-arcs" in c.url and not c.trusted for c in mod_cands)
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sys
@@ -89,6 +90,89 @@ class TestV031Security(unittest.TestCase):
         self.assertFalse(zip_item.bare_executable)
         self.assertTrue(zip_item.is_direct_download)
         self.assertTrue(zip_item.trusted)
+
+    def test_remote_install_refuses_bare_executable_before_downloading(self) -> None:
+        with mock.patch("galgame_patcher.downloader.open_url_request") as open_request:
+            with self.assertRaisesRegex(ValueError, "裸可执行文件"):
+                self.patcher.apply(
+                    "https://example.com/patch.exe",
+                    game_dir=self.game_dir,
+                    expected_sha256="a" * 64,
+                )
+        open_request.assert_not_called()
+
+    def test_downloader_rejects_executable_response_before_reading(self) -> None:
+        cases = (
+            ("https://example.com/patch.exe", {}),
+            ("https://example.com/download", {
+                "Content-Disposition": "attachment; filename=patch.cmd",
+            }),
+        )
+        for final_url, headers in cases:
+            with self.subTest(final_url=final_url, headers=headers):
+                response = mock.MagicMock()
+                response.__enter__.return_value = response
+                response.geturl.return_value = final_url
+                response.info.return_value = headers
+                with mock.patch(
+                    "galgame_patcher.downloader.open_url_request", return_value=response
+                ):
+                    with self.assertRaisesRegex(ValueError, "裸可执行文件"):
+                        downloader.download_patch(
+                            "https://example.com/download", self.root, filename="patch.zip"
+                        )
+                response.read.assert_not_called()
+        self.assertEqual(list(self.root.iterdir()), [self.game_dir])
+
+    def test_verify_file_compares_expected_sha256(self) -> None:
+        patch = self.root / "patch.xp3"
+        patch.write_bytes(b"test patch contents")
+        args = ["verify-file", str(patch), "--sha256"]
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cli_main(args + [compute_sha256(patch).upper()]), 0)
+        self.assertIn("SHA256 与预期值一致", output.getvalue())
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(cli_main(args + ["0" * 64]), 1)
+            self.assertEqual(cli_main(args + ["not-a-digest"]), 1)
+        self.assertIn("SHA256 不匹配", errors.getvalue())
+        self.assertIn("64 位十六进制值", errors.getvalue())
+
+    def test_remote_cache_separates_same_named_files_and_rejects_short_downloads(self) -> None:
+        first_url = "https://example.com/first/patch.zip"
+        second_url = "https://example.com/second/patch.zip"
+
+        def response_for(url: str, data: bytes, declared_size: int) -> mock.MagicMock:
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.geturl.return_value = url
+            response.info.return_value = {"Content-Length": str(declared_size)}
+            response.read.side_effect = [data, b""]
+            return response
+
+        responses = [response_for(first_url, b"first", 5), response_for(second_url, b"second", 6)]
+        with mock.patch(
+            "galgame_patcher.downloader.tempfile.gettempdir", return_value=str(self.root)
+        ), mock.patch("galgame_patcher.downloader.open_url_request", side_effect=responses):
+            first = downloader.download_patch(
+                first_url, expected_sha256=hashlib.sha256(b"first").hexdigest()
+            )
+            second = downloader.download_patch(
+                second_url, expected_sha256=hashlib.sha256(b"second").hexdigest()
+            )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), b"first")
+        self.assertEqual(second.read_bytes(), b"second")
+
+        with mock.patch(
+            "galgame_patcher.downloader.open_url_request",
+            return_value=response_for(second_url, b"truncated", 20),
+        ):
+            with self.assertRaisesRegex(ValueError, "下载大小不符"):
+                downloader.download_patch(second_url, dest_dir=second.parent)
+        self.assertEqual(second.read_bytes(), b"second")
+        self.assertEqual(list(second.parent.iterdir()), [second])
 
     def test_rule3_github_and_vndb_trust_filtering(self) -> None:
         fake_search_resp = {
@@ -295,7 +379,7 @@ class TestV031Security(unittest.TestCase):
         text = out_buf.getvalue()
         self.assertEqual(code, 0)
         self.assertIn("不下载任何文件", text)
-        self.assertIn("[可信]", text)
+        self.assertIn("[白名单]", text)
         self.assertIn("[未审核]", text)
         self.assertIn("该链接指向可执行文件", text)
 
