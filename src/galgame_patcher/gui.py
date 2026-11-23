@@ -18,7 +18,14 @@ from typing import Any, Callable, Optional
 
 from ._version import __version__
 from .catalog import PatchCatalog, _is_game_patched
-from .downloader import discover_patches_online, is_url
+from .downloader import (
+    OFFICIAL_PATCH_PORTALS,
+    discover_patches_online,
+    get_user_sources_path,
+    is_url,
+    load_user_sources,
+    save_user_sources,
+)
 from .locator import ManualLocator, SteamLocator
 from .models import (
     CatalogEntry,
@@ -306,10 +313,17 @@ class GalgamePatcherGUI:
         crawl_row.grid(row=6, column=1, columnspan=2, sticky=tk.W, pady=(2, 6))
         self.btn_crawl = ttk.Button(
             crawl_row,
-            text="自动上网搜索该游戏补丁 (仅提供链接)...",
+            text="上网搜索补丁 (VNDB/官方站/GitHub)...",
             command=self.on_search_online_clicked,
         )
-        self.btn_crawl.pack(side=tk.LEFT)
+        self.btn_crawl.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_portals = ttk.Button(
+            crawl_row,
+            text="官方补丁站导航...",
+            command=self.open_portals_dialog,
+        )
+        self.btn_portals.pack(side=tk.LEFT)
 
         # 本地补丁文件核验预览区（只读，显示体积与 SHA256）
         ttk.Label(right_frame, text="文件核验预览:").grid(
@@ -458,6 +472,7 @@ class GalgamePatcherGUI:
             self.btn_import_catalog,
             self.btn_export_catalog,
             self.btn_crawl,
+            self.btn_portals,
             self.btn_dry_run,
             self.btn_apply,
             self.btn_rollback,
@@ -813,7 +828,7 @@ class GalgamePatcherGUI:
 
         self._set_busy(True)
         self.progress.configure(value=20)
-        self._set_status(f"正在从公开补丁站 (VNDB / GitHub) 爬取 '{query}' 的补丁信息...", is_error=False)
+        self._set_status(f"正在从 VNDB / 官方补丁站 / PCGW / GitHub 检索 '{query}' 的链接...", is_error=False)
 
         def _worker() -> None:
             try:
@@ -974,6 +989,89 @@ class GalgamePatcherGUI:
         ttk.Button(btn_bar, text="复制链接", command=_copy_link).pack(
             side=tk.LEFT, padx=(0, 8)
         )
+        ttk.Button(btn_bar, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT)
+
+    def open_portals_dialog(self) -> None:
+        """展示官方/开源补丁站导航窗口及用户自定义站点配置入口。"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("官方与开源补丁网站导航")
+        dialog.geometry("820x440")
+        dialog.transient(self.root)
+
+        tip = ttk.Label(
+            dialog,
+            text="双击或点击“在浏览器打开”访问官方补丁页面；部分站点受 WAF 保护仅支持在浏览器中手动访问下载。",
+        )
+        tip.pack(anchor=tk.W, padx=10, pady=(8, 4))
+
+        frame = ttk.Frame(dialog, padding=(10, 0, 10, 6))
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("name", "mode", "url", "desc")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        tree.heading("name", text="网站名称")
+        tree.heading("mode", text="集成方式")
+        tree.heading("url", text="网址")
+        tree.heading("desc", text="说明")
+
+        tree.column("name", width=190, anchor=tk.W)
+        tree.column("mode", width=100, anchor=tk.CENTER)
+        tree.column("url", width=230, anchor=tk.W)
+        tree.column("desc", width=260, anchor=tk.W)
+
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        portals = list(OFFICIAL_PATCH_PORTALS)
+        for idx, page_url in enumerate(load_user_sources().get("extra_pages", []), start=1):
+            portals.append(
+                {
+                    "name": f"自定义站点 #{idx}",
+                    "url": page_url,
+                    "mode": "自定义检索",
+                    "desc": "来自 sources.json extra_pages",
+                }
+            )
+
+        for idx, item in enumerate(portals):
+            tree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(item["name"], item["mode"], item["url"], item["desc"]),
+            )
+
+        btn_bar = ttk.Frame(dialog, padding=(10, 4, 10, 10))
+        btn_bar.pack(fill=tk.X)
+
+        def _open_selected(_event: object = None) -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            webbrowser.open(portals[int(sel[0])]["url"])
+
+        def _open_sources_config() -> None:
+            cfg_path = get_user_sources_path()
+            if not cfg_path.is_file():
+                save_user_sources()
+            if sys.platform == "win32":
+                os.startfile(str(cfg_path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(cfg_path)])
+            else:
+                subprocess.Popen(["xdg-open", str(cfg_path)])
+
+        tree.bind("<Double-1>", _open_selected)
+        ttk.Button(btn_bar, text="在浏览器打开", command=_open_selected).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(
+            btn_bar,
+            text="编辑自定义站点配置 (sources.json)",
+            command=_open_sources_config,
+        ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_bar, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT)
 
     def _run_patch_task(self, *, dry_run: bool) -> None:

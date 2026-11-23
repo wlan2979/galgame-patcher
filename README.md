@@ -18,7 +18,7 @@
 > - 请勿在清单中收录指向盗版资源或未经授权分发内容的链接，本仓库也不接受此类清单或 PR。
 > - 修改游戏文件可能违反部分游戏的用户协议，后果由使用者自行承担。
 
-## 核心特性 (v0.3.1)
+## 核心特性 (v0.3.2)
 
 - **事务化安装与安全回滚（零毁档保护）**：
   - 安装过程每备份/覆盖一个文件即原子写入 `manifest.json` (`in_progress` → `committed`)；中途遇到任何异常（权限不足、磁盘满、写入后 SHA256 校验失败等）会**自动回滚本轮全部变更**，并将残留进度恢复逻辑集成在 `rollback()` 中。
@@ -28,8 +28,9 @@
 - **支持 Steam + 手工登记 + 非 Steam 深度扫描**：
   - 自动读取 Windows 注册表与 Steam `libraryfolders.vdf` / `appmanifest_<appid>.acf`。
   - 支持 `galpatch add-game <path>` 将 DMM / DLsite / 实体盘等非 Steam 游戏登记到 `%APPDATA%\galgame-patcher\games.json`；支持 `--deep` 深度扫描常见目录中的特征 Galgame 文件夹。
-- **在线补丁检索（只给链接，不自动下载）与本地文件核验**：
-  - 提供 `galpatch search <游戏名或网页URL>`（及 GUI 内置搜索按钮），检索公开数据库 (VNDB API v2)、GitHub Releases（最低 10 stars、跳过可执行资产并标注白名单/未审核状态）或指定网页链接。
+- **多站点在线补丁检索（只给链接，不自动下载）与本地文件核验**：
+  - 提供 `galpatch search <游戏名或网页URL>`（及 GUI 内置搜索按钮），已内置对接多个安全合规的官方/开源数据源：**VNDB API v2**、**柚子社官方网站 (`yuzu-soft.com/support.html`)**、**NekoNyan 官方补丁站 (`nekonyansoft.com/shop/patches`)**、**PCGamingWiki API**、**07th-Mod (`07th-mod.com`)** 以及 **GitHub Releases**（最低 10 stars、跳过可执行资产并标注白名单/未审核状态）。
+  - 提供 `galpatch sites`（与 GUI「官方补丁站导航...」）汇总 Shiravune、Kagura Games、Denpasoft、Johren、JAST USA、MangaGamer、Sekai Project 等官方补丁页面快捷入口，并支持在 `%APPDATA%\galgame-patcher\sources.json` 中自由添加自定义站点 URL 与信任域名/GitHub owner 白名单。
   - 搜索结果**只提供链接与可信度提示，不自动下载**；用户可通过浏览器下载后导入本地文件，使用 `galpatch verify-file <path>` 或 GUI 预览区核对文件大小、修改时间与 SHA256（导入裸可执行文件需强制二次确认）。
   - 远程 URL 安装必须配置 `expected_sha256` 锁定内容，否则默认拒绝安装（`UntrustedSourceError`）。
 - **清单管理**：
@@ -88,9 +89,15 @@ galpatch scan --only-installed --include-manual --deep
 galpatch add-game "D:\Games\MyDlsiteGame"
 
 # 3) 上网检索公开补丁链接（只列出链接与可信度，不下载任何文件）
-galpatch search "Game Title"
-galpatch search "Game Title" --open 1
+galpatch search "Senren Banka"
+galpatch search "Senren Banka" --open 1
+galpatch search "https://www.yuzu-soft.com"
 galpatch search "https://example.com/patch-release-page.html" --json
+
+# 3.5) 查看官方/开源补丁站快捷入口或初始化自定义站点配置文件
+galpatch sites
+galpatch sites --init-config
+galpatch sites --open 2
 
 # 4) 安装前检查本地补丁文件信息并核对 SHA256
 galpatch verify-file ./downloaded_patch.zip

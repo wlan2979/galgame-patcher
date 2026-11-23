@@ -19,6 +19,7 @@ from .models import (
     BARE_EXECUTABLE_SUFFIXES,
     COMMON_ARCHIVE_EXTENSIONS,
     OnlinePatchCandidate,
+    get_appdata_dir,
 )
 
 logger = logging.getLogger("galgame_patcher")
@@ -37,22 +38,186 @@ _DIRECT_DOWNLOAD_SUFFIXES: tuple[str, ...] = COMMON_ARCHIVE_EXTENSIONS
 # 永远不视为可自动下载安装的补丁。
 _BARE_EXECUTABLE_SUFFIXES: tuple[str, ...] = BARE_EXECUTABLE_SUFFIXES
 
-# 官方发行商补丁域名白名单。刻意保持极短：白名单不是安全保证，
-# 只是「至少不是路人注册的仓库」这一层最低筛选。
+# 官方发行商及公开百科/开源组织补丁域名白名单。
+# 白名单只是「最低层来源过滤」，不代表工具担保内容安全。
 _TRUSTED_PATCH_DOMAINS: tuple[str, ...] = (
     "nekonyansoft.com",
     "jastusa.com",
     "mangagamer.com",
     "sekaiproject.com",
     "frontwing.com",
+    "yuzu-soft.com",
+    "yuzu-soft.jp",
+    "shiravune.com",
+    "kaguragames.com",
+    "denpasoft.com",
+    "johren.net",
+    "07th-mod.com",
+    "pcgamingwiki.com",
 )
 
 # 可信 GitHub 仓库 owner 白名单。默认空 —— 需要用户自行确认后追加，
-# 因为「哪个 GitHub 账号是可信的补丁作者」没有通用答案。
+# 可直接在 %APPDATA%\galgame-patcher\sources.json 的 trusted_github_owners 中配置。
 _TRUSTED_GITHUB_OWNERS: tuple[str, ...] = ()
 
 # GitHub 仓库搜索的最低 star 门槛
 DEFAULT_MIN_GITHUB_STARS = 10
+
+# 官方与开源补丁网站快捷导航（用于 CLI sites 与 GUI 官方站导航窗口）
+OFFICIAL_PATCH_PORTALS: tuple[dict[str, str], ...] = (
+    {
+        "name": "VNDB（视觉小说补丁数据库）",
+        "url": "https://vndb.org/r",
+        "mode": "内置API搜索",
+        "desc": "涵盖大多数作品的官方补丁与社区补丁发布索引",
+    },
+    {
+        "name": "柚子社 Yuzusoft 官方支持页",
+        "url": "https://www.yuzu-soft.com/support.html",
+        "mode": "内置搜索/直链",
+        "desc": "Yuzusoft 历代作品官方修正补丁下载与支持汇总",
+    },
+    {
+        "name": "NekoNyan 官方补丁站",
+        "url": "https://nekonyansoft.com/shop/patches",
+        "mode": "内置搜索/导航",
+        "desc": "NekoNyan 发行作品的官方 18+ / 恢复补丁下载页",
+    },
+    {
+        "name": "PCGamingWiki（修复与补丁百科）",
+        "url": "https://www.pcgamingwiki.com/",
+        "mode": "内置API搜索",
+        "desc": "PC 游戏与视觉小说官方更新、兼容性修复指引",
+    },
+    {
+        "name": "07th-Mod（寒蝉/海猫开源语音补丁）",
+        "url": "https://07th-mod.com/",
+        "mode": "内置搜索/导航",
+        "desc": "07th Expansion 作品的高清立绘与全语音开源补丁项目",
+    },
+    {
+        "name": "Shiravune（白舟）官方网站",
+        "url": "https://www.shiravune.com/",
+        "mode": "浏览器打开",
+        "desc": "Shiravune 发行作品官方补丁页（站内 Patches 栏目）",
+    },
+    {
+        "name": "Kagura Games 官方站",
+        "url": "https://www.kaguragames.com/",
+        "mode": "浏览器打开",
+        "desc": "Kagura Games 官方免费补丁页面（站内 Patches 栏目）",
+    },
+    {
+        "name": "Denpasoft 官方站",
+        "url": "https://denpasoft.com/",
+        "mode": "浏览器打开",
+        "desc": "Denpasoft 官方未删减补丁发布商店",
+    },
+    {
+        "name": "Johren 官方平台",
+        "url": "https://www.johren.net/",
+        "mode": "浏览器打开",
+        "desc": "Johren 官方正版平台与未删减版本",
+    },
+    {
+        "name": "JAST USA 官方站",
+        "url": "https://jastusa.com/",
+        "mode": "浏览器打开",
+        "desc": "JAST USA 官方补丁与正版发行站",
+    },
+    {
+        "name": "MangaGamer 官方站",
+        "url": "https://www.mangagamer.com/",
+        "mode": "浏览器打开",
+        "desc": "MangaGamer 官方支持与正版补丁发布站",
+    },
+    {
+        "name": "Sekai Project 官方站",
+        "url": "https://sekaiproject.com/",
+        "mode": "浏览器打开",
+        "desc": "Sekai Project 官方补丁公告与支持站",
+    },
+)
+
+_YUZUSOFT_ALIASES: dict[str, tuple[str, ...]] = {
+    "senren": ("千恋", "万花", "senren", "banka"),
+    "riddle": ("riddle", "joker", "谜题"),
+    "sabbat": ("sabbat", "witch", "魔女", "夜宴"),
+    "stella": ("stella", "cafe", "喫茶", "星光"),
+    "ten_sz": ("tenshin", "天使", "騒々", "reboot"),
+    "tenshin": ("tenshin", "天使", "騒々"),
+    "lllj": ("limelight", "lemonade", "lllj", "ライムライト"),
+    "amairo": ("amairo", "isle", "天色"),
+    "dracu": ("dracu", "riot"),
+    "noble": ("noble", "works"),
+    "bra": ("braban", "ぶらばん"),
+    "parquete": ("parquete", "パルフェ"),
+}
+
+_07TH_KEYWORDS: tuple[str, ...] = (
+    "07th",
+    "higurashi",
+    "umineko",
+    "ciconia",
+    "ryukishi",
+    "寒蝉",
+    "海猫",
+    "白鹳",
+)
+
+
+def get_user_sources_path() -> Path:
+    """返回用户自定义补丁站点与白名单配置文件路径（%APPDATA%\\galgame-patcher\\sources.json）。"""
+    return get_appdata_dir() / "sources.json"
+
+
+def load_user_sources() -> dict[str, list[str]]:
+    """读取用户自定义的检索页面列表、信任域名与 GitHub owner 白名单。"""
+    default_data: dict[str, list[str]] = {
+        "extra_pages": [],
+        "trusted_domains": [],
+        "trusted_github_owners": [],
+    }
+    path = get_user_sources_path()
+    if not path.is_file():
+        return default_data
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return default_data
+        for key in ("extra_pages", "trusted_domains", "trusted_github_owners"):
+            val = raw.get(key)
+            if isinstance(val, list):
+                default_data[key] = [str(item).strip() for item in val if str(item).strip()]
+        return default_data
+    except (OSError, json.JSONDecodeError):
+        return default_data
+
+
+def save_user_sources(
+    *,
+    extra_pages: Optional[Sequence[str]] = None,
+    trusted_domains: Optional[Sequence[str]] = None,
+    trusted_github_owners: Optional[Sequence[str]] = None,
+) -> Path:
+    """保存或初始化用户自定义站点配置 sources.json。"""
+    current = load_user_sources()
+    if extra_pages is not None:
+        current["extra_pages"] = [str(x).strip() for x in extra_pages if str(x).strip()]
+    if trusted_domains is not None:
+        current["trusted_domains"] = [
+            str(x).strip().lower() for x in trusted_domains if str(x).strip()
+        ]
+    if trusted_github_owners is not None:
+        current["trusted_github_owners"] = [
+            str(x).strip() for x in trusted_github_owners if str(x).strip()
+        ]
+
+    path = get_user_sources_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, **current}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def is_url(source: Union[str, Path]) -> bool:
@@ -81,14 +246,16 @@ def is_direct_patch_url(url: str) -> bool:
 
 
 def _is_trusted_domain(url: str) -> bool:
-    """判断 URL 主机名是否命中官方发行商域名白名单或其子域名。"""
+    """判断 URL 主机名是否命中内置官方或用户自定义域名白名单。"""
     host = urllib.parse.urlparse(url).hostname
     if not host:
         return False
     host_lower = host.lower()
+    user_domains = load_user_sources().get("trusted_domains", [])
+    all_domains = list(_TRUSTED_PATCH_DOMAINS) + [d.lower() for d in user_domains]
     return any(
         host_lower == domain or host_lower.endswith("." + domain)
-        for domain in _TRUSTED_PATCH_DOMAINS
+        for domain in all_domains
     )
 
 
@@ -397,7 +564,10 @@ def crawl_github_patch_releases(
 
     candidates: list[OnlinePatchCandidate] = []
     seen_urls: set[str] = set()
-    trusted_owners_lower = {o.lower() for o in _TRUSTED_GITHUB_OWNERS}
+    user_owners = load_user_sources().get("trusted_github_owners", [])
+    trusted_owners_lower = {
+        o.lower() for o in (list(_TRUSTED_GITHUB_OWNERS) + list(user_owners))
+    }
     dropped_low_stars = 0
     skipped_executables = 0
 
@@ -495,6 +665,282 @@ def crawl_github_patch_releases(
     return candidates
 
 
+def _tokenize_query(query: str) -> list[str]:
+    """将游戏名称拆分为用于匹配页面标题和锚点 slug 的小写词元列表。"""
+    tokens = [t for t in re.split(r"[\s*＊_\-:：/()\[\]]+", query.lower()) if t]
+    return tokens
+
+
+def crawl_yuzusoft_patches(
+    game_query: str = "",
+    *,
+    timeout: float = 12.0,
+    proxies: Optional[dict[str, str]] = None,
+) -> list[OnlinePatchCandidate]:
+    """从柚子社官方网站 (yuzu-soft.com/support.html) 检索官方修正补丁与支持页链接。"""
+    support_url = "https://www.yuzu-soft.com/support.html"
+    html_text = fetch_text(support_url, timeout=timeout, proxies=proxies)
+    parser = _AnchorExtractor()
+    parser.feed(html_text)
+
+    query_lower = game_query.strip().lower()
+    tokens = _tokenize_query(game_query)
+    is_broad = (not query_lower) or any(
+        k in query_lower for k in ("yuzu", "柚子", "ゆず")
+    )
+
+    candidates: list[OnlinePatchCandidate] = []
+    seen_urls: set[str] = set()
+    matched_subpages: list[str] = []
+
+    for raw_href, label in parser.links:
+        full_url = urllib.parse.urljoin(support_url, raw_href)
+        url_lower = full_url.lower()
+        combined = f"{label} {url_lower}".lower()
+
+        if is_direct_patch_url(full_url):
+            if is_broad or any(tok in combined for tok in tokens):
+                if full_url not in seen_urls:
+                    seen_urls.add(full_url)
+                    domain_ok = _is_trusted_domain(full_url)
+                    candidates.append(
+                        OnlinePatchCandidate(
+                            title=label or PurePosixPath(urllib.parse.urlparse(full_url).path).name,
+                            url=full_url,
+                            source_site="Yuzusoft",
+                            is_direct_download=True,
+                            official=True,
+                            description="柚子社官方支持页提供的修正补丁压缩包",
+                            trusted=domain_ok,
+                            trust_reason=(
+                                "柚子社官方支持页直链（域名命中官方白名单）"
+                                if domain_ok
+                                else "从柚子社官方支持页提取的外链"
+                            ),
+                            bare_executable=is_executable_url(full_url),
+                        )
+                    )
+            continue
+
+        if "/products/" in url_lower and ("sup" in url_lower or "support" in url_lower):
+            hit = is_broad
+            if not hit:
+                hit = any(tok in combined for tok in tokens)
+            if not hit:
+                for slug_key, alias_words in _YUZUSOFT_ALIASES.items():
+                    if slug_key in url_lower and any(
+                        alias in query_lower for alias in alias_words
+                    ):
+                        hit = True
+                        break
+            if hit and full_url not in matched_subpages:
+                matched_subpages.append(full_url)
+
+    # 对命中的作品支持子页（最多展开前 3 个，防止泛搜请求风暴）继续抓取具体补丁链接
+    for subpage_url in matched_subpages[:3]:
+        if subpage_url not in seen_urls:
+            seen_urls.add(subpage_url)
+            candidates.append(
+                OnlinePatchCandidate(
+                    title=f"Yuzusoft 支持页 ({PurePosixPath(urllib.parse.urlparse(subpage_url).path).parent.name})",
+                    url=subpage_url,
+                    source_site="Yuzusoft",
+                    is_direct_download=False,
+                    official=True,
+                    description="柚子社对应作品官方支持页面",
+                    trusted=_is_trusted_domain(subpage_url),
+                    trust_reason="柚子社官方支持页（域名命中官方白名单）",
+                    bare_executable=False,
+                )
+            )
+        try:
+            sub_items = scrape_patch_links_from_page(
+                subpage_url, timeout=timeout, proxies=proxies
+            )
+            for item in sub_items:
+                if item.url not in seen_urls and (
+                    item.is_direct_download or "patch" in item.title.lower() or "パッチ" in item.title
+                ):
+                    seen_urls.add(item.url)
+                    item.source_site = "Yuzusoft"
+                    item.official = True
+                    candidates.append(item)
+        except Exception as exc:
+            logger.debug("抓取柚子社子页 %s 失败: %s", subpage_url, exc)
+
+    return candidates
+
+
+def crawl_nekonyan_patches(
+    game_query: str,
+    *,
+    timeout: float = 12.0,
+    proxies: Optional[dict[str, str]] = None,
+) -> list[OnlinePatchCandidate]:
+    """从 NekoNyan 官方补丁汇总页 (nekonyansoft.com/shop/patches) 检索对应作品补丁入口。"""
+    base_page = "https://nekonyansoft.com/shop/patches"
+    html_text = fetch_text(base_page, timeout=timeout, proxies=proxies)
+    parser = _AnchorExtractor()
+    parser.feed(html_text)
+
+    query_lower = game_query.strip().lower()
+    tokens = [t for t in _tokenize_query(game_query) if len(t) >= 2]
+    is_broad = "nekonyan" in query_lower
+
+    candidates: list[OnlinePatchCandidate] = []
+    seen_urls: set[str] = set()
+
+    for raw_href, label in parser.links:
+        if not raw_href.startswith("#") or len(raw_href) <= 1:
+            continue
+        title = label or raw_href[1:]
+        haystack = f"{title} {raw_href}".lower()
+        if not is_broad:
+            if not tokens or not any(tok in haystack for tok in tokens):
+                continue
+
+        full_url = f"{base_page}{raw_href}"
+        if full_url in seen_urls:
+            continue
+        seen_urls.add(full_url)
+        candidates.append(
+            OnlinePatchCandidate(
+                title=title,
+                url=full_url,
+                source_site="NekoNyan",
+                is_direct_download=False,
+                official=True,
+                description="NekoNyan 官方补丁页面（点击在浏览器直达该游戏下载卡片）",
+                trusted=True,
+                trust_reason="NekoNyan 官方补丁页（域名命中发行商白名单）",
+                bare_executable=False,
+            )
+        )
+        if len(candidates) >= 15:
+            break
+
+    return candidates
+
+
+def crawl_pcgamingwiki_patches(
+    game_query: str,
+    *,
+    timeout: float = 12.0,
+    proxies: Optional[dict[str, str]] = None,
+) -> list[OnlinePatchCandidate]:
+    """通过 PCGamingWiki MediaWiki 公开 API 检索游戏修复与官方补丁百科页面。"""
+    query = game_query.strip()
+    if not query:
+        return []
+
+    encoded = urllib.parse.quote(query)
+    api_url = (
+        f"https://www.pcgamingwiki.com/w/api.php"
+        f"?action=query&list=search&srsearch={encoded}&srlimit=5&format=json"
+    )
+    data = fetch_json(api_url, timeout=timeout, proxies=proxies)
+    if not isinstance(data, dict):
+        return []
+
+    search_items = data.get("query", {}).get("search", [])
+    if not isinstance(search_items, list):
+        return []
+
+    candidates: list[OnlinePatchCandidate] = []
+    for item in search_items:
+        if not isinstance(item, dict) or not item.get("title"):
+            continue
+        title = str(item["title"]).strip()
+        slug = urllib.parse.quote(title.replace(" ", "_"), safe="/():*'!~-")
+        url_str = f"https://www.pcgamingwiki.com/wiki/{slug}"
+        candidates.append(
+            OnlinePatchCandidate(
+                title=f"{title} - PCGamingWiki 修复与补丁参考",
+                url=url_str,
+                source_site="PCGamingWiki",
+                is_direct_download=False,
+                official=False,
+                description="PCGamingWiki 百科词条（含官方补丁/兼容性修复说明与外链）",
+                trusted=_is_trusted_domain(url_str),
+                trust_reason="PCGamingWiki 公开百科页面（域名命中白名单）",
+                bare_executable=False,
+            )
+        )
+    return candidates
+
+
+def crawl_07th_mod_patches(
+    game_query: str,
+    *,
+    timeout: float = 12.0,
+    proxies: Optional[dict[str, str]] = None,
+) -> list[OnlinePatchCandidate]:
+    """针对寒蝉/海猫等 07th 作品检索 07th-Mod 官方与 GitHub 开源补丁仓库。"""
+    query_lower = game_query.strip().lower()
+    if not any(kw in query_lower for kw in _07TH_KEYWORDS):
+        return []
+
+    candidates: list[OnlinePatchCandidate] = [
+        OnlinePatchCandidate(
+            title="07th-Mod 官方补丁站 (寒蝉/海猫语音与立绘增强)",
+            url="https://07th-mod.com/",
+            source_site="07th-Mod",
+            is_direct_download=False,
+            official=True,
+            description="07th-Mod 官方网站与安装向导",
+            trusted=_is_trusted_domain("https://07th-mod.com/"),
+            trust_reason="07th-Mod 官方网站（域名命中白名单）",
+            bare_executable=False,
+        )
+    ]
+
+    user_owners = load_user_sources().get("trusted_github_owners", [])
+    owner_trusted = "07th-mod" in {
+        o.lower() for o in (list(_TRUSTED_GITHUB_OWNERS) + list(user_owners))
+    }
+    trust_reason = (
+        "owner 在本地可信白名单内"
+        if owner_trusted
+        else "07th-Mod GitHub 开源仓库，默认未加入个人 owner 白名单"
+    )
+
+    try:
+        repos = fetch_json(
+            "https://api.github.com/orgs/07th-mod/repos?per_page=15&sort=updated",
+            timeout=timeout,
+            proxies=proxies,
+        )
+        if isinstance(repos, list):
+            tokens = _tokenize_query(game_query)
+            for repo in repos:
+                if not isinstance(repo, dict):
+                    continue
+                full_name = str(repo.get("full_name") or "")
+                html_url = str(repo.get("html_url") or "")
+                desc = str(repo.get("description") or "")
+                stars = int(repo.get("stargazers_count") or 0)
+                haystack = f"{full_name} {desc}".lower()
+                if "07th" not in query_lower and not any(t in haystack for t in tokens if len(t) >= 3):
+                    continue
+                if html_url:
+                    candidates.append(
+                        OnlinePatchCandidate(
+                            title=f"{full_name} ({stars} stars)",
+                            url=html_url,
+                            source_site="07th-Mod (GitHub)",
+                            is_direct_download=False,
+                            description=desc or "07th-Mod 官方开源仓库",
+                            trusted=owner_trusted,
+                            trust_reason=trust_reason,
+                            bare_executable=False,
+                        )
+                    )
+    except Exception as exc:
+        logger.debug("检索 07th-Mod GitHub 仓库失败: %s", exc)
+
+    return candidates
+
+
 def discover_patches_online(
     query_or_url: str,
     *,
@@ -502,7 +948,7 @@ def discover_patches_online(
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
 ) -> list[OnlinePatchCandidate]:
-    """自动从网站爬取对应游戏的补丁候选列表（只返回链接信息，不参与自动下载）。"""
+    """自动从公开网站检索对应游戏的补丁候选列表（只返回链接信息，不参与自动下载）。"""
     target = query_or_url.strip()
     if not target:
         return []
@@ -517,13 +963,23 @@ def discover_patches_online(
                 results.append(item)
 
     if is_url(target):
+        parsed_target = urllib.parse.urlparse(target)
+        host_lower = (parsed_target.hostname or "").lower()
+        if (host_lower == "yuzu-soft.com" or host_lower.endswith(".yuzu-soft.com")) and parsed_target.path in ("", "/", "/index.html"):
+            try:
+                _extend(crawl_yuzusoft_patches("", timeout=timeout, proxies=proxies))
+            except Exception as exc:
+                logger.warning("爬取 yuzu-soft.com 支持页失败: %s", exc)
+            return results
+
         try:
             _extend(scrape_patch_links_from_page(target, timeout=timeout, proxies=proxies))
         except Exception as exc:
             logger.warning("爬取页面 %s 失败: %s", target, exc)
         return results
 
-    for page_url in extra_page_urls or ():
+    configured_pages = list(extra_page_urls or ()) + load_user_sources().get("extra_pages", [])
+    for page_url in configured_pages:
         try:
             _extend(
                 scrape_patch_links_from_page(
@@ -533,15 +989,18 @@ def discover_patches_online(
         except Exception as exc:
             logger.debug("爬取自定义页面 %s 失败: %s", page_url, exc)
 
-    try:
-        _extend(crawl_vndb_patches(target, timeout=timeout, proxies=proxies))
-    except Exception as exc:
-        logger.debug("VNDB 补丁搜索失败: %s", exc)
-
-    try:
-        _extend(crawl_github_patch_releases(target, timeout=timeout, proxies=proxies))
-    except Exception as exc:
-        logger.debug("GitHub 补丁搜索失败: %s", exc)
+    for crawler in (
+        crawl_vndb_patches,
+        crawl_yuzusoft_patches,
+        crawl_nekonyan_patches,
+        crawl_pcgamingwiki_patches,
+        crawl_07th_mod_patches,
+        crawl_github_patch_releases,
+    ):
+        try:
+            _extend(crawler(target, timeout=timeout, proxies=proxies))
+        except Exception as exc:
+            logger.debug("来源检索 %s 失败: %s", crawler.__name__, exc)
 
     results.sort(
         key=lambda c: (

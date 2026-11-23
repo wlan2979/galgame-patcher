@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .catalog import PatchCatalog
-from .downloader import discover_patches_online
+from .downloader import (
+    OFFICIAL_PATCH_PORTALS,
+    discover_patches_online,
+    get_user_sources_path,
+    load_user_sources,
+    save_user_sources,
+)
 from .locator import ManualLocator, SteamLocator
 from .models import ConcurrencyError, GameRunningError, UntrustedSourceError
 from .patcher import GalgamePatcher, compute_sha256, inspect_patch_file
@@ -143,6 +149,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="json_output",
         action="store_true",
         help="以 JSON 格式输出搜索结果",
+    )
+
+    # sites 子命令（官方/开源补丁站导航与自定义来源配置）
+    sites_parser = subparsers.add_parser(
+        "sites", help="列出官方/开源补丁网站快捷入口与自定义来源配置文件路径"
+    )
+    sites_parser.add_argument(
+        "--open",
+        dest="open_index",
+        type=int,
+        metavar="N",
+        help="直接在系统浏览器中打开第 N 个网站",
+    )
+    sites_parser.add_argument(
+        "--init-config",
+        action="store_true",
+        help="生成或刷新用户自定义补丁站点配置文件 (%APPDATA%\\galgame-patcher\\sources.json)",
     )
 
     # verify-file 子命令（安装前本地文件安全核验）
@@ -403,6 +426,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "请用浏览器自行下载，下载后在工具里用本地文件路径安装，\n"
                 "安装前会显示文件 SHA256 供你核对。"
             )
+            return 0
+
+        if args.command == "sites":
+            if args.init_config:
+                cfg_path = save_user_sources()
+                print(f"已初始化自定义补丁来源配置文件: {cfg_path}")
+
+            portals = list(OFFICIAL_PATCH_PORTALS)
+            user_cfg = load_user_sources()
+            for idx, page_url in enumerate(user_cfg.get("extra_pages", []), start=1):
+                portals.append(
+                    {
+                        "name": f"自定义站点 #{idx}",
+                        "url": page_url,
+                        "mode": "自定义检索",
+                        "desc": "来自用户 sources.json extra_pages",
+                    }
+                )
+
+            if args.open_index is not None:
+                if args.open_index < 1 or args.open_index > len(portals):
+                    print(
+                        f"错误: --open 序号超出范围（共 {len(portals)} 个站点，指定了 {args.open_index}）",
+                        file=sys.stderr,
+                    )
+                    return 1
+                chosen = portals[args.open_index - 1]
+                webbrowser.open(chosen["url"])
+                print(f"已在浏览器中打开: {chosen['name']} -> {chosen['url']}")
+                return 0
+
+            print("官方 / 开源补丁网站与公共数据库导航：\n")
+            for idx, site in enumerate(portals, start=1):
+                print(f"{idx}. [{site['mode']}] {site['name']}")
+                print(f"   URL: {site['url']}")
+                print(f"   说明: {site['desc']}")
+
+            print(f"\n自定义站点与白名单配置文件: {get_user_sources_path()}")
+            print("可使用 `galpatch sites --open <序号>` 在浏览器中打开对应站点，或 `--init-config` 生成配置模板。")
             return 0
 
         if args.command == "verify-file":
