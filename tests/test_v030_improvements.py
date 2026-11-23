@@ -166,10 +166,11 @@ class TestV030Improvements(unittest.TestCase):
     def test_failed_automatic_restore_keeps_recovery_manifest(self) -> None:
         source = self.root / "a.xp3"
         source.write_bytes(b"NEW_A")
+        target = (self.game_dir / "a.xp3").resolve()
         real_copy2 = shutil.copy2
 
         def fail_writes_to_game(src: Path, dst: Path) -> object:
-            if dst == self.game_dir / "a.xp3":
+            if Path(dst).resolve() == target:
                 raise PermissionError("模拟安装和自动还原时目标不可写")
             return real_copy2(src, dst)
 
