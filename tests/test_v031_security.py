@@ -344,6 +344,30 @@ class TestV031Security(unittest.TestCase):
         self.assertTrue(exe_info.is_bare_executable)
         self.assertIn("裸可执行文件", exe_info.describe())
 
+    def test_verbose_search_reports_timeout_without_changing_json_output(self) -> None:
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch("galgame_patcher.downloader.fetch_text", side_effect=TimeoutError):
+            with redirect_stdout(output), redirect_stderr(errors):
+                code = cli_main(["search", "https://example.com/patches", "--json", "--verbose"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue()), [])
+        self.assertIn("example.com", errors.getvalue())
+        self.assertIn("请求超时", errors.getvalue())
+
+    def test_require_sha256_rejects_unverified_local_patch(self) -> None:
+        patch = self.root / "extra.xp3"
+        patch.write_bytes(b"sample patch")
+        args = ["apply", str(patch), "--game-dir", str(self.game_dir), "--require-sha256"]
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(cli_main(args), 1)
+        self.assertIn("--sha256", errors.getvalue())
+        self.assertFalse((self.game_dir / patch.name).exists())
+
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(cli_main(args + ["--sha256", compute_sha256(patch)]), 0)
+        self.assertEqual((self.game_dir / patch.name).read_bytes(), b"sample patch")
+
     def test_rule5_cli_search_links_only_verify_file_and_gui_import(self) -> None:
         fake_cands = [
             OnlinePatchCandidate(

@@ -63,6 +63,8 @@ class TestV032Sites(unittest.TestCase):
                 return support_html
             if url.split("?", 1)[0].endswith(("/senren_sup.html", "/download.html")):
                 return senren_sup_html
+            if url.endswith("/riddle_sup.html"):
+                raise TimeoutError
             raise AssertionError(f"Unexpected URL: {url}")
 
         with mock.patch("galgame_patcher.downloader.fetch_text", side_effect=_fake_fetch_text):
@@ -87,9 +89,11 @@ class TestV032Sites(unittest.TestCase):
         self.assertEqual(archive_cands, [installer])
 
         # 直接把 https://www.yuzu-soft.com 传给 discover_patches_online 应自动解析 support.html
+        on_failure = mock.Mock()
         with mock.patch("galgame_patcher.downloader.fetch_text", side_effect=_fake_fetch_text):
-            root_cands = discover_patches_online("https://www.yuzu-soft.com")
+            root_cands = discover_patches_online("https://www.yuzu-soft.com", on_failure=on_failure)
         self.assertTrue(any("p_tenshin_savefix.zip" in c.url for c in root_cands))
+        on_failure.assert_called_once_with("柚子社作品页", "请求超时")
 
     def test_nekonyan_pcgamingwiki_and_07th_mod_crawlers(self) -> None:
         nn_html = """

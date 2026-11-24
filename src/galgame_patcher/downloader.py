@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import html.parser
+import http.client
 import json
 import logging
 import re
@@ -27,6 +28,8 @@ logger = logging.getLogger("galgame_patcher")
 ProgressCallback = Callable[[int, Optional[int]], None]
 
 DEFAULT_TIMEOUT = 30.0
+SearchFailureCallback = Callable[[str, str], None]
+_SEARCH_ERRORS = (OSError, http.client.HTTPException, ValueError)
 _CHUNK_SIZE = 64 * 1024
 _FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\r\n]+)")
 _FILENAME_RE = re.compile(r'filename\s*=\s*"?([^";\r\n]+)"?')
@@ -517,7 +520,9 @@ def crawl_vndb_patches(
         timeout=timeout,
         proxies=proxies,
     )
-    items = data.get("results", []) if isinstance(data, dict) else []
+    items = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("VNDB 未返回发行版本列表")
     candidates: list[OnlinePatchCandidate] = []
     seen_urls: set[str] = set()
 
@@ -595,6 +600,7 @@ def crawl_github_patch_releases(
     min_stars: int = DEFAULT_MIN_GITHUB_STARS,
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
+    on_failure: Optional[SearchFailureCallback] = None,
 ) -> list[OnlinePatchCandidate]:
     """通过 GitHub 公开 API 搜索游戏相关开源补丁仓库及其 Release 压缩包链接。"""
     query = game_query.strip()
@@ -604,7 +610,9 @@ def crawl_github_patch_releases(
     encoded_q = urllib.parse.quote(f"{query} patch")
     search_url = f"https://api.github.com/search/repositories?q={encoded_q}&per_page=10"
     data = fetch_json(search_url, timeout=timeout, proxies=proxies)
-    repos = data.get("items", []) if isinstance(data, dict) else []
+    repos = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(repos, list):
+        raise ValueError("GitHub 未返回仓库列表")
 
     candidates: list[OnlinePatchCandidate] = []
     seen_urls: set[str] = set()
@@ -654,7 +662,12 @@ def crawl_github_patch_releases(
         rel_api = f"https://api.github.com/repos/{full_name}/releases/latest"
         try:
             rel_data = fetch_json(rel_api, timeout=timeout, proxies=proxies)
-        except Exception:
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                _report_search_failure("GitHub Releases", exc, on_failure)
+            rel_data = None
+        except _SEARCH_ERRORS as exc:
+            _report_search_failure("GitHub Releases", exc, on_failure)
             rel_data = None
 
         if isinstance(rel_data, dict):
@@ -720,6 +733,7 @@ def crawl_yuzusoft_patches(
     *,
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
+    on_failure: Optional[SearchFailureCallback] = None,
 ) -> list[OnlinePatchCandidate]:
     """从柚子社官方网站 (yuzu-soft.com/support.html) 检索官方修正补丁与支持页链接。"""
     support_url = "https://www.yuzu-soft.com/support.html"
@@ -817,8 +831,8 @@ def crawl_yuzusoft_patches(
                     item.source_site = "Yuzusoft"
                     item.official = True
                     candidates.append(item)
-        except Exception as exc:
-            logger.debug("抓取柚子社子页 %s 失败: %s", subpage_url, exc)
+        except _SEARCH_ERRORS as exc:
+            _report_search_failure("柚子社作品页", exc, on_failure)
 
     return candidates
 
@@ -893,12 +907,10 @@ def crawl_pcgamingwiki_patches(
         f"?action=query&list=search&srsearch={encoded}&srlimit=5&format=json"
     )
     data = fetch_json(api_url, timeout=timeout, proxies=proxies)
-    if not isinstance(data, dict):
-        return []
-
-    search_items = data.get("query", {}).get("search", [])
+    response_query = data.get("query") if isinstance(data, dict) else None
+    search_items = response_query.get("search") if isinstance(response_query, dict) else None
     if not isinstance(search_items, list):
-        return []
+        raise ValueError("PCGamingWiki 未返回搜索列表")
 
     candidates: list[OnlinePatchCandidate] = []
     for item in search_items:
@@ -928,6 +940,7 @@ def crawl_07th_mod_patches(
     *,
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
+    on_failure: Optional[SearchFailureCallback] = None,
 ) -> list[OnlinePatchCandidate]:
     """针对寒蝉/海猫等作品检索 07th-Mod 社区项目与 GitHub 仓库。"""
     query_lower = game_query.strip().lower()
@@ -988,10 +1001,28 @@ def crawl_07th_mod_patches(
                             bare_executable=False,
                         )
                     )
-    except Exception as exc:
-        logger.debug("检索 07th-Mod GitHub 仓库失败: %s", exc)
+    except _SEARCH_ERRORS as exc:
+        _report_search_failure("07th-Mod GitHub", exc, on_failure)
 
     return candidates
+
+
+def _report_search_failure(
+    source: str, error: Exception, on_failure: Optional[SearchFailureCallback]
+) -> None:
+    if isinstance(error, urllib.error.HTTPError):
+        detail = f"HTTP {error.code}"
+    elif isinstance(error, TimeoutError) or (
+        isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError)
+    ):
+        detail = "请求超时"
+    elif isinstance(error, json.JSONDecodeError):
+        detail = "返回的数据无法解析为 JSON"
+    else:
+        detail = f"{type(error).__name__}: {error}"
+    logger.debug("检索来源 %s 失败: %s", source, detail)
+    if on_failure is not None:
+        on_failure(source, detail)
 
 
 def discover_patches_online(
@@ -1000,8 +1031,9 @@ def discover_patches_online(
     extra_page_urls: Optional[Sequence[str]] = None,
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
+    on_failure: Optional[SearchFailureCallback] = None,
 ) -> list[OnlinePatchCandidate]:
-    """自动从公开网站检索对应游戏的补丁候选列表（只返回链接信息，不参与自动下载）。"""
+    """返回公开补丁候选。可用 on_failure(source, detail) 接收来源访问失败。"""
     target = query_or_url.strip()
     if not target:
         return []
@@ -1022,15 +1054,15 @@ def discover_patches_online(
         host_lower = (parsed_target.hostname or "").lower()
         if (host_lower == "yuzu-soft.com" or host_lower.endswith(".yuzu-soft.com")) and parsed_target.path in ("", "/", "/index.html"):
             try:
-                _extend(crawl_yuzusoft_patches("", timeout=timeout, proxies=proxies))
-            except Exception as exc:
-                logger.warning("爬取 yuzu-soft.com 支持页失败: %s", exc)
+                _extend(crawl_yuzusoft_patches("", timeout=timeout, proxies=proxies, on_failure=on_failure))
+            except _SEARCH_ERRORS as exc:
+                _report_search_failure("柚子社", exc, on_failure)
             return results
 
         try:
             _extend(scrape_patch_links_from_page(target, timeout=timeout, proxies=proxies))
-        except Exception as exc:
-            logger.warning("爬取页面 %s 失败: %s", target, exc)
+        except _SEARCH_ERRORS as exc:
+            _report_search_failure(parsed_target.hostname or "指定网页", exc, on_failure)
         return results
 
     configured_pages = list(extra_page_urls or ()) + load_user_sources().get("extra_pages", [])
@@ -1041,21 +1073,21 @@ def discover_patches_online(
                     page_url, keyword=target, timeout=timeout, proxies=proxies
                 )
             )
-        except Exception as exc:
-            logger.debug("爬取自定义页面 %s 失败: %s", page_url, exc)
+        except _SEARCH_ERRORS as exc:
+            _report_search_failure("自定义网页", exc, on_failure)
 
-    for crawler in (
-        crawl_vndb_patches,
-        crawl_yuzusoft_patches,
-        crawl_nekonyan_patches,
-        crawl_pcgamingwiki_patches,
-        crawl_07th_mod_patches,
-        crawl_github_patch_releases,
+    for source, crawler, kwargs in (
+        ("VNDB", crawl_vndb_patches, {}),
+        ("柚子社", crawl_yuzusoft_patches, {"on_failure": on_failure}),
+        ("NekoNyan", crawl_nekonyan_patches, {}),
+        ("PCGamingWiki", crawl_pcgamingwiki_patches, {}),
+        ("07th-Mod", crawl_07th_mod_patches, {"on_failure": on_failure}),
+        ("GitHub", crawl_github_patch_releases, {"on_failure": on_failure}),
     ):
         try:
-            _extend(crawler(target, timeout=timeout, proxies=proxies))
-        except Exception as exc:
-            logger.debug("来源检索 %s 失败: %s", crawler.__name__, exc)
+            _extend(crawler(target, timeout=timeout, proxies=proxies, **kwargs))
+        except _SEARCH_ERRORS as exc:
+            _report_search_failure(source, exc, on_failure)
 
     results.sort(
         key=lambda c: (
