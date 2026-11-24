@@ -204,7 +204,7 @@ class TestV030Improvements(unittest.TestCase):
         with mock.patch("galgame_patcher.patcher._is_file_locked", return_value=True):
             with self.assertRaises(GameRunningError) as ctx:
                 self.patcher.apply(patch_file, game_dir=self.game_dir)
-            self.assertIn("以下文件正被其他程序占用", str(ctx.exception))
+            self.assertIn("无法以可写方式打开以下文件", str(ctx.exception))
             self.assertIn("a.xp3", str(ctx.exception))
             self.assertEqual((self.game_dir / "a.xp3").read_bytes(), b"ORIG_A")
 
@@ -215,7 +215,7 @@ class TestV030Improvements(unittest.TestCase):
                     ["apply", str(patch_file), "--game-dir", str(self.game_dir)]
                 )
             self.assertEqual(code, 2)
-            self.assertIn("正被其他程序占用", stderr_buf.getvalue())
+            self.assertIn("检查文件权限", stderr_buf.getvalue())
 
             # 使用 --force-locked 可跳过占用检查
             with redirect_stdout(io.StringIO()):

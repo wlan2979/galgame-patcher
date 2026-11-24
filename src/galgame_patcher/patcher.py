@@ -375,8 +375,14 @@ class GalgamePatcher:
             source_origin="catalog",
         )
 
-    def rollback(self, game_dir: Union[str, Path]) -> PatchResult:
-        """根据备份清单将游戏目录还原至打补丁前状态，失败时保留备份（P0-3）。"""
+    def rollback(
+        self, game_dir: Union[str, Path], *, mode: str = "full", to: Optional[str] = None
+    ) -> PatchResult:
+        """完整还原，或撤回安装至指定记录（默认撤回最近一次）。"""
+        if mode not in ("full", "keep-patches"):
+            raise ValueError(f"未知的回滚模式: {mode}")
+        if to is not None and mode != "keep-patches":
+            raise ValueError("指定安装记录时需要使用 keep-patches 模式")
         resolved_game_dir = Path(game_dir).resolve()
         if not resolved_game_dir.is_dir():
             raise FileNotFoundError(f"游戏目录不存在: {resolved_game_dir}")
@@ -385,10 +391,30 @@ class GalgamePatcher:
         manifest_path = backup_root / "manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(f"未找到补丁备份清单: {manifest_path}")
-
         with self._directory_lock(resolved_game_dir):
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not manifest_path.is_file():
+                raise FileNotFoundError(f"未找到补丁备份清单: {manifest_path}")
+            manifest = self._read_backup_manifest(manifest_path)
             status = manifest.get("status", "committed")
+            if mode == "keep-patches":
+                if status == "in_progress":
+                    raise ValueError("检测到未完成的安装，请先执行完整回滚")
+                if to is None:
+                    return self._undo_latest_install(resolved_game_dir, backup_root, manifest)
+                history = self._read_rollback_history(backup_root, manifest)
+                ids = [record_id for record_id, _ in history]
+                if to not in ids:
+                    raise ValueError(f"找不到安装记录 {to}，请用 rollback --history 查看")
+                if to == ids[0]:
+                    return PatchResult(success=True, game_dir=resolved_game_dir,
+                                       message=f"已经处于安装记录 {to}")
+                for _ in range(ids.index(to)):
+                    result = self._undo_latest_install(resolved_game_dir, backup_root, manifest)
+                    if not result.success:
+                        return result
+                    manifest = self._read_backup_manifest(manifest_path)
+                result.message = f"已恢复至安装记录 {to}。"
+                return result
             backed_up_files: list[str] = manifest.get("backed_up_files", [])
             newly_added_files: list[str] = manifest.get("newly_added_files", [])
             backup_files_root = backup_root / "files"
@@ -400,27 +426,27 @@ class GalgamePatcher:
 
             for rel_posix in backed_up_files:
                 rel_path = Path(rel_posix)
-                backup_file = backup_files_root / rel_path
-                target_file = resolved_game_dir / rel_path
                 try:
+                    backup_file = self._restore_path(backup_files_root, rel_path)
+                    target_file = self._restore_game_path(resolved_game_dir, rel_path)
                     if not backup_file.is_file():
                         raise FileNotFoundError(f"备份文件缺失: {backup_file}")
                     target_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(backup_file, target_file)
                     restored.append(rel_posix)
-                except Exception as exc:
+                except (OSError, ValueError) as exc:
                     failed_files.append(rel_posix)
                     failed_reasons[rel_posix] = f"{type(exc).__name__}: {exc}"
 
             for rel_posix in newly_added_files:
-                target_file = resolved_game_dir / Path(rel_posix)
-                if not target_file.exists():
-                    continue
                 try:
+                    target_file = self._restore_game_path(resolved_game_dir, Path(rel_posix))
+                    if not target_file.exists():
+                        continue
                     target_file.unlink()
                     removed_new.append(rel_posix)
                     self._cleanup_empty_parents(target_file.parent, resolved_game_dir)
-                except Exception as exc:
+                except (OSError, ValueError) as exc:
                     failed_files.append(rel_posix)
                     failed_reasons[rel_posix] = f"{type(exc).__name__}: {exc}"
 
@@ -431,7 +457,6 @@ class GalgamePatcher:
             )
 
             if failed_files:
-                details = "; ".join(f"{f} ({failed_reasons[f]})" for f in failed_files)
                 return PatchResult(
                     success=False,
                     game_dir=resolved_game_dir,
@@ -439,7 +464,7 @@ class GalgamePatcher:
                     backed_up_files=[],
                     backup_dir=backup_root,
                     message=(
-                        f"{in_progress_prefix}回滚部分失败：{len(failed_files)} 个文件处理出错 [{details}]。"
+                        f"回滚部分失败：{len(failed_files)} 个文件处理出错。"
                         "备份已保留，修复问题后可重试回滚。"
                     ),
                     failed_files=failed_files,
@@ -455,7 +480,7 @@ class GalgamePatcher:
                     shutil.rmtree(backup_files_root)
                 if manifest_path.exists():
                     manifest_path.unlink()
-            except Exception as exc:
+            except OSError as exc:
                 logger.warning("清理备份内容失败: %s", exc)
 
         return PatchResult(
@@ -466,10 +491,149 @@ class GalgamePatcher:
             backup_dir=None,
             message=(
                 f"{in_progress_prefix}已成功回滚补丁：还原 {len(restored)} 个原文件，"
-                f"移除 {len(newly_added_files)} 个新增文件。"
+                f"移除 {len(removed_new)} 个新增文件。"
             ),
             failed_files=[],
             failed_reasons={},
+            verified=True,
+        )
+
+    @staticmethod
+    def _read_backup_manifest(manifest_path: Path) -> dict:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"无法读取备份清单 {manifest_path}，已保留备份: {exc}") from exc
+        if not isinstance(manifest, dict) or any(
+            not isinstance(manifest.get(key), list)
+            or not all(isinstance(item, str) for item in manifest[key])
+            for key in ("backed_up_files", "newly_added_files")
+        ):
+            raise ValueError(f"备份清单格式无效，已保留备份: {manifest_path}")
+        return manifest
+
+    @staticmethod
+    def _restore_path(root: Path, relative: Path) -> Path:
+        if relative.anchor or ".." in relative.parts or not relative.parts:
+            raise ValueError(f"备份记录包含越界路径: {relative}")
+        target = root.absolute() / relative
+        if target.resolve() != target:
+            raise ValueError(f"备份记录包含越界路径: {relative}")
+        return target
+
+    def _restore_game_path(self, game_dir: Path, relative: Path) -> Path:
+        if relative.parts and relative.parts[0].casefold() == self.BACKUP_FOLDER_NAME:
+            raise ValueError(f"回滚不能写入备份目录: {relative}")
+        return self._restore_path(game_dir, relative)
+
+    def rollback_history(self, game_dir: Union[str, Path]) -> list[tuple[str, str]]:
+        """列出有快照的安装记录，最近一次在前。"""
+        game_dir = Path(game_dir).resolve()
+        if not game_dir.is_dir():
+            raise FileNotFoundError(f"游戏目录不存在: {game_dir}")
+        backup_root = game_dir / self.BACKUP_FOLDER_NAME
+        manifest_path = backup_root / "manifest.json"
+        if not manifest_path.is_file():
+            return []
+        with self._directory_lock(game_dir):
+            if not manifest_path.is_file():
+                return []
+            return self._read_rollback_history(backup_root, self._read_backup_manifest(manifest_path))
+
+    def _read_rollback_history(self, backup_root: Path, manifest: dict) -> list[tuple[str, str]]:
+        if manifest.get("status") == "in_progress":
+            raise ValueError("检测到未完成的安装，请先执行完整回滚")
+        history = []
+        seen = set()
+        while manifest.get("status") == "committed" and manifest.get("latest_install") is not None:
+            snapshot_dir, journal = self._read_install_journal(backup_root, manifest)
+            if snapshot_dir.name in seen:
+                raise ValueError("安装记录出现重复引用")
+            seen.add(snapshot_dir.name)
+            history.append((snapshot_dir.name, journal["applied_at"]))
+            manifest = journal["previous_manifest"] or {}
+        return history
+
+    def _read_install_journal(self, backup_root: Path, manifest: dict) -> tuple[Path, dict]:
+        latest = manifest.get("latest_install")
+        if manifest.get("status") != "committed" or not isinstance(latest, str):
+            raise ValueError("没有可撤回的最近一次安装记录。旧备份仍可使用完整回滚。")
+        if not latest.startswith("install-") or Path(latest).name != latest:
+            raise ValueError("最近一次安装记录中的目录无效")
+        snapshot_dir = self._restore_path(backup_root, Path(latest))
+        journal = json.loads((snapshot_dir / "undo.json").read_text(encoding="utf-8"))
+        if (
+            not isinstance(journal, dict)
+            or not isinstance(journal.get("applied_at"), str)
+            or not isinstance(journal.get("prior_contents"), dict)
+            or "previous_manifest" not in journal
+            or (journal["previous_manifest"] is not None and not isinstance(journal["previous_manifest"], dict))
+        ):
+            raise ValueError("最近一次安装记录的格式无效")
+        return snapshot_dir, journal
+
+    def _undo_latest_install(
+        self, game_dir: Path, backup_root: Path, manifest: dict
+    ) -> PatchResult:
+        snapshot_dir, journal = self._read_install_journal(backup_root, manifest)
+        changes = journal["prior_contents"]
+        previous = journal["previous_manifest"]
+
+        plan = []
+        for name, saved in reversed(list(changes.items())):
+            relative = Path(name)
+            target = self._restore_game_path(game_dir, relative)
+            if saved is not None and (
+                not isinstance(saved, str)
+                or Path(saved) not in (Path("files") / relative, Path(snapshot_dir.name, "files") / relative)
+            ):
+                raise ValueError(f"安装记录中的备份路径无效: {name}")
+            snapshot = self._restore_path(backup_root, Path(saved)) if saved is not None else None
+            if snapshot is not None and not snapshot.is_file():
+                raise FileNotFoundError(f"缺少最近一次安装的备份: {name}")
+            plan.append((name, target, snapshot))
+
+        restored = []
+        failures = {}
+        for name, target, snapshot in plan:
+            try:
+                if snapshot is None:
+                    target.unlink(missing_ok=True)
+                    self._cleanup_empty_parents(target.parent, game_dir)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(snapshot, target)
+                    restored.append(name)
+            except OSError as exc:
+                failures[name] = str(exc)
+
+        if failures:
+            return PatchResult(
+                success=False, game_dir=game_dir, installed_files=restored,
+                backed_up_files=[], backup_dir=backup_root,
+                message="撤回最近一次安装时部分文件处理失败，已保留记录，可重试。",
+                failed_files=list(failures), failed_reasons=failures,
+            )
+
+        manifest_path = backup_root / "manifest.json"
+        if previous is None:
+            manifest_path.unlink()
+        else:
+            _write_manifest_atomic(manifest_path, previous)
+        try:
+            shutil.rmtree(snapshot_dir)
+            if previous is None and (backup_root / "files").exists():
+                shutil.rmtree(backup_root / "files")
+        except OSError as exc:
+            logger.warning("清理已撤回的安装备份失败: %s", exc)
+        if previous is None:
+            summary = "已恢复至首次跟踪安装前的状态。"
+        else:
+            summary = "较早的安装记录已保留。"
+        return PatchResult(
+            success=True, game_dir=game_dir, installed_files=restored,
+            backed_up_files=[], backup_dir=backup_root if previous else None,
+            message=f"已撤回最近一次安装（{journal['applied_at']}）。{summary}",
             verified=True,
         )
 
@@ -608,10 +772,7 @@ class GalgamePatcher:
             existing_newly_added: set[str] = set()
             previous_manifest = None
             if manifest_path.is_file():
-                try:
-                    old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    old_manifest = {}
+                old_manifest = self._read_backup_manifest(manifest_path)
                 if old_manifest.get("status") == "in_progress":
                     raise ValueError("上次安装未完成，请先回滚后重试")
                 if old_manifest and old_manifest.get("status") != "rolled_back":
@@ -624,13 +785,15 @@ class GalgamePatcher:
             prior_contents: dict[str, Optional[Path]] = {}
             snapshot_dir: Optional[Path] = None
 
-            def _sync_manifest(status: str) -> None:
+            def _sync_manifest(status: str, latest_install: Optional[str] = None) -> None:
                 payload = {
                     "version": 1,
                     "status": status,
                     "backed_up_files": sorted(existing_backed_up),
                     "newly_added_files": sorted(existing_newly_added),
                 }
+                if latest_install is not None:
+                    payload["latest_install"] = latest_install
                 _write_manifest_atomic(manifest_path, payload)
 
             _sync_manifest("in_progress")
@@ -677,7 +840,7 @@ class GalgamePatcher:
                                 snapshot_dir = Path(
                                     tempfile.mkdtemp(prefix="install-", dir=backup_root)
                                 )
-                            snapshot = snapshot_dir / rel_posix
+                            snapshot = snapshot_dir / "files" / rel_posix
                             snapshot.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(dst_file, snapshot)
                         else:
@@ -719,9 +882,23 @@ class GalgamePatcher:
                         )
 
                 if backup:
-                    _sync_manifest("committed")
+                    if snapshot_dir is None:
+                        snapshot_dir = Path(tempfile.mkdtemp(prefix="install-", dir=backup_root))
+                    _write_manifest_atomic(
+                        snapshot_dir / "undo.json",
+                        {
+                            "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "previous_manifest": previous_manifest,
+                            "prior_contents": {
+                                name: snapshot.relative_to(backup_root).as_posix() if snapshot else None
+                                for name, snapshot in prior_contents.items()
+                            },
+                        },
+                    )
+                    _sync_manifest("committed", snapshot_dir.name)
                 elif previous_manifest is not None:
-                    _write_manifest_atomic(manifest_path, previous_manifest)
+                    retained = {key: value for key, value in previous_manifest.items() if key != "latest_install"}
+                    _write_manifest_atomic(manifest_path, retained)
                 else:
                     manifest_path.unlink()
 
@@ -738,7 +915,7 @@ class GalgamePatcher:
                         raise RuntimeError(note) from exc
                 raise
 
-            if snapshot_dir is not None:
+            if snapshot_dir is not None and not backup:
                 shutil.rmtree(snapshot_dir, ignore_errors=True)
 
             if backup:
@@ -821,7 +998,9 @@ def apply_patch(
     )
 
 
-def rollback_patch(game_dir: Union[str, Path]) -> PatchResult:
+def rollback_patch(
+    game_dir: Union[str, Path], *, mode: str = "full", to: Optional[str] = None
+) -> PatchResult:
     """一键回滚指定游戏目录补丁的便捷函数。"""
     patcher = GalgamePatcher()
-    return patcher.rollback(game_dir=game_dir)
+    return patcher.rollback(game_dir=game_dir, mode=mode, to=to)

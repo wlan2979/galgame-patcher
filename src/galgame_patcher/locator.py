@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 from .models import GALGAME_ARCHIVE_INDICATORS, GameProfile, get_appdata_dir
+
+logger = logging.getLogger("galgame_patcher")
 
 PathLike = Union[str, os.PathLike, Path]
 ScanProgressCallback = Callable[[Path, int], None]
@@ -60,7 +63,8 @@ def is_likely_galgame_dir(directory: Path) -> bool:
         return False
     try:
         entries = list(directory.iterdir())
-    except OSError:
+    except OSError as exc:
+        logger.debug("无法检查游戏目录 %s: %s", directory, exc)
         return False
 
     has_exe = False
@@ -135,9 +139,12 @@ class ManualLocator:
             elif isinstance(data, list):
                 raw_list = data
             else:
-                return []
+                raise ValueError("根节点应为列表或对象")
+            if not isinstance(raw_list, list):
+                raise ValueError("games 应为列表")
             return [item for item in raw_list if isinstance(item, dict)]
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError) as exc:
+            logger.warning("无法读取手工登记清单 %s: %s", self.config_path, exc)
             return []
 
     def save_games(self, games: Sequence[dict[str, Any]]) -> None:
@@ -243,7 +250,12 @@ def iter_deep_scan_candidates(
 ) -> Iterator[Path]:
     """可中断的生成器：遍历指定根目录（默认 C:/D:/E:，深度 <= 3）发现非 Steam Galgame 目录（P2-1）。"""
     if roots is not None:
-        search_roots = [Path(r) for r in roots if Path(r).is_dir()]
+        search_roots = []
+        for path in map(Path, roots):
+            if path.is_dir():
+                search_roots.append(path)
+            else:
+                logger.warning("深度扫描目录不存在或不可访问: %s", path)
     elif sys.platform == "win32":
         search_roots = [
             Path(f"{drive}:\\")
@@ -283,7 +295,9 @@ def iter_deep_scan_candidates(
                 (p for p in current.iterdir() if p.is_dir() and not p.is_symlink()),
                 key=lambda p: p.name.lower(),
             )
-        except OSError:
+        except OSError as exc:
+            logger.log(logging.WARNING if depth == 0 else logging.DEBUG,
+                       "无法扫描目录 %s: %s", current, exc)
             return
 
         for child in children:
@@ -339,13 +353,15 @@ class SteamLocator:
         self.deep_scan_roots: Optional[list[Path]] = (
             [Path(p) for p in deep_scan_roots] if deep_scan_roots is not None else None
         )
+        if self._explicit_steam_root is not None and not self._explicit_steam_root.is_dir():
+            logger.warning("指定的 Steam 目录不存在或不可访问: %s", self._explicit_steam_root)
 
     def detect_steam_root(self) -> Optional[Path]:
         """自动探测本地 Steam 根目录（优先指定路径，其次 Windows 注册表与默认路径）。"""
         if self._explicit_steam_root is not None:
             return (
                 self._explicit_steam_root
-                if self._explicit_steam_root.exists()
+                if self._explicit_steam_root.is_dir()
                 else None
             )
 
@@ -422,8 +438,8 @@ class SteamLocator:
                 for match in _VDF_PATH_PATTERN.finditer(content):
                     raw_path = match.group(1).replace("\\\\", "\\")
                     _add_if_valid(Path(raw_path))
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.warning("无法读取 Steam 库配置 %s: %s", vdf_path, exc)
 
         return libraries
 
@@ -437,17 +453,20 @@ class SteamLocator:
                 continue
             try:
                 acf_files = sorted(steamapps_dir.glob("appmanifest_*.acf"))
-            except OSError:
+            except OSError as exc:
+                logger.warning("无法列出 Steam 游戏清单 %s: %s", steamapps_dir, exc)
                 continue
             for manifest_path in acf_files:
                 try:
                     content = manifest_path.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
+                except OSError as exc:
+                    logger.warning("无法读取 Steam 游戏清单 %s: %s", manifest_path, exc)
                     continue
                 id_match = _ACF_APPID_PATTERN.search(content)
                 dir_match = _ACF_INSTALLDIR_PATTERN.search(content)
                 name_match = _ACF_NAME_PATTERN.search(content)
                 if not id_match or not dir_match:
+                    logger.warning("Steam 游戏清单缺少 App ID 或安装目录: %s", manifest_path)
                     continue
                 app_id = int(id_match.group(1))
                 if app_id in seen_ids:
@@ -484,11 +503,13 @@ class SteamLocator:
 
             try:
                 content = manifest_path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
+            except OSError as exc:
+                logger.warning("无法读取 Steam 游戏清单 %s: %s", manifest_path, exc)
                 continue
 
             match = _ACF_INSTALLDIR_PATTERN.search(content)
             if not match:
+                logger.warning("Steam 游戏清单缺少安装目录: %s", manifest_path)
                 continue
 
             install_dir_name = match.group(1).strip()
@@ -517,7 +538,8 @@ class SteamLocator:
                 continue
             try:
                 entries = sorted(root.iterdir(), key=lambda p: p.name.lower())
-            except OSError:
+            except OSError as exc:
+                logger.warning("无法列出游戏搜索目录 %s: %s", root, exc)
                 continue
 
             for entry in entries:

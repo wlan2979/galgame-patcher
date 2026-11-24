@@ -9,9 +9,13 @@ import json
 import logging
 import re
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import urllib.robotparser
+from email.utils import parsedate_to_datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional, Sequence, Union
 
@@ -30,6 +34,11 @@ ProgressCallback = Callable[[int, Optional[int]], None]
 DEFAULT_TIMEOUT = 30.0
 SearchFailureCallback = Callable[[str, str], None]
 _SEARCH_ERRORS = (OSError, http.client.HTTPException, ValueError)
+_USER_AGENT = f"galgame-patcher/{__version__}"
+_RETRY_HTTP = {429, 500, 502, 503, 504}
+_site_lock = threading.Lock()
+_next_request: dict[str, float] = {}
+_robots_cache: dict[str, tuple[float, urllib.robotparser.RobotFileParser, Optional[str]]] = {}
 _CHUNK_SIZE = 64 * 1024
 _FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\r\n]+)")
 _FILENAME_RE = re.compile(r'filename\s*=\s*"?([^";\r\n]+)"?')
@@ -67,6 +76,16 @@ _TRUSTED_GITHUB_OWNERS: tuple[str, ...] = ()
 DEFAULT_MIN_GITHUB_STARS = 10
 
 _NEKONYAN_PATCH_PAGE = "https://patches.nekonyansoft.com/"
+_KAGURA_PATCH_PAGE = "https://www.kaguragames.com/patch/"
+_KAGURA_TITLE_TOKEN_RE = re.compile(r"[^\W_]+")
+_KAGURA_KNOWN_PATCHES = (
+    ("Summer Memories Patch", "/product/summer-memories-patch/"),
+    ("Summer Memories+ – Expansion DLC Patch", "/product/summer-memories-expansion-dlc-patch/"),
+    ("Magical Swordmaiden Patch", "/product/magical-swordmaiden-patch/"),
+    ("Ruins Seeker Patch", "/product/ruins-seeker-steam-patch/"),
+    ("Dark Hero Party Patch", "/product/dark-hero-party-steam-patch/"),
+)
+_PATCH_HINTS = ("patch", "补丁", "パッチ", "restoration", "uncensor", "去遮挡", "反和谐", "修復")
 _NEKONYAN_TITLE_TOKEN_RE = re.compile(r"[^\W\d_]+|\d+")
 _SENREN_DOWNLOAD_PAGE = "https://www.yuzu-soft.com/products/senren/download.html"
 
@@ -110,9 +129,15 @@ OFFICIAL_PATCH_PORTALS: tuple[dict[str, str], ...] = (
     },
     {
         "name": "Kagura Games 补丁目录",
-        "url": "https://www.kaguragames.com/patch/",
-        "mode": "浏览器打开",
+        "url": _KAGURA_PATCH_PAGE,
+        "mode": "内置搜索/导航",
         "desc": "发行商补丁目录，适用版本及费用见各条目",
+    },
+    {
+        "name": "2DFan 社区入口",
+        "url": "https://github.com/2dfan/domains",
+        "mode": "浏览器打开",
+        "desc": "社区发布的域名入口，作品帖及其附件的授权与发行版需自行核对",
     },
     {
         "name": "Denpasoft 官方站",
@@ -269,14 +294,18 @@ def _is_trusted_domain(url: str) -> bool:
     )
 
 
-def _build_opener(proxies: Optional[dict[str, str]] = None) -> urllib.request.OpenerDirector:
+def _build_opener(
+    proxies: Optional[dict[str, str]] = None,
+    redirect_handler: Optional[urllib.request.HTTPRedirectHandler] = None,
+) -> urllib.request.OpenerDirector:
     """构建统一遵循系统或自定义代理配置的 URL Opener（P2-2）。"""
     proxy_handler = (
         urllib.request.ProxyHandler(proxies)
         if proxies is not None
         else urllib.request.ProxyHandler()
     )
-    return urllib.request.build_opener(proxy_handler)
+    handlers = [proxy_handler] if redirect_handler is None else [proxy_handler, redirect_handler]
+    return urllib.request.build_opener(*handlers)
 
 
 def open_url_request(
@@ -287,10 +316,11 @@ def open_url_request(
     headers: Optional[dict[str, str]] = None,
     timeout: float = DEFAULT_TIMEOUT,
     proxies: Optional[dict[str, str]] = None,
+    redirect_handler: Optional[urllib.request.HTTPRedirectHandler] = None,
 ):
     """统一发起网络请求，使用相同的 User-Agent、代理和超时设置（P2-2）。"""
     merged_headers = {
-        "User-Agent": f"galgame-patcher/{__version__}",
+        "User-Agent": _USER_AGENT,
     }
     if headers:
         merged_headers.update(headers)
@@ -302,8 +332,148 @@ def open_url_request(
     )
     if url.strip().lower().startswith("file://"):
         return urllib.request.urlopen(request, timeout=timeout)
-    opener = _build_opener(proxies=proxies)
+    opener = _build_opener(proxies=proxies, redirect_handler=redirect_handler)
     return opener.open(request, timeout=timeout)
+
+
+def _pace_search_request(url: str, deadline: float) -> None:
+    host = urllib.parse.urlsplit(url).hostname
+    if host is None:
+        raise ValueError("网页 URL 缺少主机名")
+    interval = 1.6 if host == "api.vndb.org" else 1.0
+    while True:
+        with _site_lock:
+            now = time.monotonic()
+            wait = _next_request.get(host, now) - now
+            if now + max(wait, 0) >= deadline:
+                raise TimeoutError("等待站点限速窗口超时")
+            if wait <= 0:
+                _next_request[host] = now + interval
+                return
+        time.sleep(wait)
+
+
+def _retry_delay(error: urllib.error.HTTPError) -> Optional[float]:
+    value = (error.headers.get("Retry-After") or "").strip() if error.headers else ""
+    if value.isdecimal():
+        return int(value)
+    if value:
+        try:
+            when = parsedate_to_datetime(value)
+            return max(0.0, when.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    return None
+
+
+class _SearchRedirects(urllib.request.HTTPRedirectHandler):
+    def __init__(self, authorize: Callable[[str], None], deadline: float) -> None:
+        self.authorize = authorize
+        self.deadline = deadline
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            self.authorize(redirected.full_url)
+            req.timeout = min(req.timeout, self.deadline - time.monotonic())
+        return redirected
+
+
+def _fetch_metadata(
+    url: str,
+    *,
+    method: str = "GET",
+    data: Optional[bytes] = None,
+    headers: Optional[dict[str, str]] = None,
+    timeout: float,
+    proxies: Optional[dict[str, str]],
+    check_robots: bool = False,
+) -> bytes:
+    target = urllib.parse.urlsplit(url)
+    if target.scheme == "file":
+        with open_url_request(url, method=method, data=data, headers=headers, timeout=timeout, proxies=proxies) as response:
+            return response.read()
+    if target.scheme not in ("http", "https"):
+        raise ValueError("搜索来源只支持 HTTP、HTTPS 或本地文件")
+
+    deadline = time.monotonic() + timeout
+    vndb_query = method == "POST" and target.hostname == "api.vndb.org" and target.path == "/kana/release"
+    attempts = 3 if method == "GET" or vndb_query else 1
+
+    def authorize(request_url: str) -> None:
+        if urllib.parse.urlsplit(request_url).scheme not in ("http", "https"):
+            raise ValueError("搜索重定向目标只支持 HTTP 或 HTTPS")
+        if check_robots:
+            _check_robots(request_url, deadline=deadline, proxies=proxies)
+        _pace_search_request(request_url, deadline)
+
+    redirect_handler = _SearchRedirects(authorize, deadline)
+    for attempt in range(attempts):
+        authorize(url)
+        remaining = deadline - time.monotonic()
+        request_timeout = min(remaining, timeout / 2) if attempt + 1 < attempts else remaining
+        if vndb_query:
+            request_timeout = min(request_timeout, 3.0)
+        delay = 0.5 * 2**attempt
+        try:
+            with open_url_request(
+                url, method=method, data=data, headers=headers, timeout=request_timeout,
+                proxies=proxies, redirect_handler=redirect_handler,
+            ) as response:
+                return response.read()
+        except _SEARCH_ERRORS as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                retryable = exc.code in _RETRY_HTTP
+                retry_after = _retry_delay(exc)
+                if retryable and retry_after is not None:
+                    delay = max(delay, retry_after)
+                    host = urllib.parse.urlsplit(exc.geturl() or url).hostname
+                    if host:
+                        with _site_lock:
+                            _next_request[host] = max(_next_request.get(host, 0), time.monotonic() + delay)
+                exc.close()
+            else:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                retryable = isinstance(
+                    reason, (TimeoutError, ConnectionError, http.client.RemoteDisconnected, http.client.IncompleteRead)
+                )
+            if not retryable or attempt + 1 >= attempts or time.monotonic() + delay >= deadline:
+                raise
+            logger.debug("重试 %s 的搜索请求，等待 %.1f 秒", target.hostname, delay)
+            time.sleep(delay)
+    raise AssertionError("request retry loop did not finish")
+
+
+def _check_robots(url: str, *, deadline: float, proxies: Optional[dict[str, str]]) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    site = f"{parsed.scheme}://{parsed.netloc}"
+    with _site_lock:
+        cached = _robots_cache.get(site)
+    if cached is None or cached[0] <= time.monotonic():
+        rules = urllib.robotparser.RobotFileParser()
+        denied = None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("检查 robots.txt 超时")
+        try:
+            robots = _fetch_metadata(
+                site + "/robots.txt", timeout=min(5.0, remaining), proxies=proxies
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                denied = f"robots.txt 无法读取（HTTP {exc.code}）"
+            elif exc.code not in (404, 410):
+                raise ValueError(f"robots.txt 无法读取（HTTP {exc.code}）") from exc
+            robots = b""
+        rules.parse(robots.decode("utf-8-sig", errors="replace").splitlines())
+        with _site_lock:
+            _robots_cache[site] = (time.monotonic() + (600 if denied else 3600), rules, denied)
+    else:
+        _, rules, denied = cached
+    if denied:
+        raise ValueError(denied)
+    if not rules.can_fetch("galgame-patcher", url):
+        raise ValueError("robots.txt 禁止自动访问此网页")
 
 
 def fetch_text(
@@ -313,8 +483,9 @@ def fetch_text(
     proxies: Optional[dict[str, str]] = None,
 ) -> str:
     """通过统一网络配置拉取远程文本内容。"""
-    with open_url_request(url, timeout=timeout, proxies=proxies) as response:
-        return response.read().decode("utf-8", errors="replace")
+    return _fetch_metadata(
+        url, timeout=timeout, proxies=proxies, check_robots=True
+    ).decode("utf-8", errors="replace")
 
 
 def fetch_json(
@@ -335,15 +506,14 @@ def fetch_json(
         data_bytes = json.dumps(payload).encode("utf-8")
         req_headers["Content-Type"] = "application/json"
 
-    with open_url_request(
+    raw_text = _fetch_metadata(
         url,
         method=method,
         data=data_bytes,
         headers=req_headers,
         timeout=timeout,
         proxies=proxies,
-    ) as response:
-        raw_text = response.read().decode("utf-8", errors="replace")
+    ).decode("utf-8", errors="replace")
     return json.loads(raw_text)
 
 
@@ -466,10 +636,10 @@ def scrape_patch_links_from_page(
             continue
         direct = is_direct_patch_url(full_url)
         combined_text = f"{label} {full_url}".lower()
-        mentions_patch = any(term in combined_text for term in ("patch", "补丁", "パッチ"))
+        mentions_patch = any(term in combined_text for term in _PATCH_HINTS)
         if not mentions_patch and (senren_page or not direct):
             continue
-        if keyword_lower and keyword_lower not in combined_text and not direct:
+        if keyword_lower and keyword_lower not in combined_text and keyword_lower not in page_url.lower():
             continue
 
         seen_urls.add(full_url)
@@ -737,11 +907,17 @@ def crawl_yuzusoft_patches(
 ) -> list[OnlinePatchCandidate]:
     """从柚子社官方网站 (yuzu-soft.com/support.html) 检索官方修正补丁与支持页链接。"""
     support_url = "https://www.yuzu-soft.com/support.html"
-    html_text = fetch_text(support_url, timeout=timeout, proxies=proxies)
+    query_lower = game_query.strip().lower()
+    try:
+        html_text = fetch_text(support_url, timeout=timeout, proxies=proxies)
+    except _SEARCH_ERRORS as exc:
+        _report_search_failure("柚子社", exc, on_failure)
+        if any(alias in query_lower for alias in _YUZUSOFT_ALIASES["senren"]):
+            return [_senren_installer_candidate()]
+        return []
+
     parser = _AnchorExtractor()
     parser.feed(html_text)
-
-    query_lower = game_query.strip().lower()
     tokens = _tokenize_query(game_query)
     is_broad = (not query_lower) or any(
         k in query_lower for k in ("yuzu", "柚子", "ゆず")
@@ -887,6 +1063,66 @@ def crawl_nekonyan_patches(
         if len(candidates) >= 15:
             break
 
+    return candidates
+
+
+def crawl_kagura_patches(
+    game_query: str,
+    *,
+    timeout: float = 12.0,
+    proxies: Optional[dict[str, str]] = None,
+    on_failure: Optional[SearchFailureCallback] = None,
+) -> list[OnlinePatchCandidate]:
+    """从 Kagura Games 的发行商目录查找还原补丁商品页。"""
+    game_query = re.sub(
+        r"\s*(?:restoration patch|uncensor(?:ed)? patch|patch|去遮挡(?:补丁)?|反和谐(?:补丁)?|还原补丁|汉化补丁|补丁)\s*$",
+        "", game_query, flags=re.IGNORECASE,
+    )
+    query_parts = _KAGURA_TITLE_TOKEN_RE.findall(game_query.casefold())
+    if not query_parts:
+        return []
+    query = " ".join(query_parts)
+    parser = _AnchorExtractor()
+    try:
+        parser.feed(fetch_text(_KAGURA_PATCH_PAGE, timeout=timeout, proxies=proxies))
+    except _SEARCH_ERRORS as exc:
+        _report_search_failure("Kagura Games", exc, on_failure)
+    candidates = []
+    seen = set()
+    known_links = [(href, title) for title, href in _KAGURA_KNOWN_PATCHES]
+    for href, label in known_links + parser.links:
+        url = urllib.parse.urlsplit(urllib.parse.urljoin(_KAGURA_PATCH_PAGE, href))
+        if (
+            url.scheme != "https"
+            or url.netloc.lower() not in ("www.kaguragames.com", "kaguragames.com")
+            or not url.path.startswith("/product/")
+        ):
+            continue
+        title = label or PurePosixPath(url.path).name.replace("-", " ")
+        title_key = " ".join(_KAGURA_TITLE_TOKEN_RE.findall(title.casefold()))
+        if (
+            not title_key.endswith(" patch")
+            or f" {query} " not in f" {title_key} "
+            or ("+" in game_query and "+" not in title and " dlc " not in f" {title_key} ")
+        ):
+            continue
+        product = url._replace(netloc="www.kaguragames.com", path=url.path.rstrip("/") + "/",
+                               query="", fragment="").geturl()
+        if product in seen:
+            continue
+        seen.add(product)
+        candidates.append(
+            OnlinePatchCandidate(
+                title=title,
+                url=product,
+                source_site="Kagura Games",
+                official=True,
+                trusted=True,
+                trust_reason="发行商补丁页面",
+                manual_install=True,
+                description="查阅发行商页面核对商店、语言和 DLC，按发行商步骤运行安装器。",
+            )
+        )
     return candidates
 
 
@@ -1080,6 +1316,7 @@ def discover_patches_online(
         ("VNDB", crawl_vndb_patches, {}),
         ("柚子社", crawl_yuzusoft_patches, {"on_failure": on_failure}),
         ("NekoNyan", crawl_nekonyan_patches, {}),
+        ("Kagura Games", crawl_kagura_patches, {"on_failure": on_failure}),
         ("PCGamingWiki", crawl_pcgamingwiki_patches, {}),
         ("07th-Mod", crawl_07th_mod_patches, {"on_failure": on_failure}),
         ("GitHub", crawl_github_patch_releases, {"on_failure": on_failure}),

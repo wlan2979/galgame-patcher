@@ -51,4 +51,6 @@ preview = patcher.apply_from_catalog(
 print(preview.message)
 ```
 
-直接安装本地文件可调用 `apply_patch("./patch.zip", game_dir="./MyGame")`。安装前可传入 `expected_sha256`，也可对加密包传入 `password`。需要还原时可调用 `rollback_patch("./MyGame")`。
+直接安装本地文件可调用 `apply_patch("./patch.zip", game_dir="./MyGame")`。安装前可传入 `expected_sha256`，也可对加密包传入 `password`。
+
+调用 `rollback_patch("./MyGame")` 完整回滚，或传入 `mode="keep-patches"` 撤回最近一次安装。用 `GalgamePatcher().rollback_history("./MyGame")` 查询记录 ID 和 UTC 时间，再用 `rollback_patch("./MyGame", mode="keep-patches", to=record_id)` 恢复到某次安装完成后的状态。扫描结果的 `patched` 为 `None` 时，备份清单需要检查。

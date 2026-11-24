@@ -22,11 +22,11 @@ galpatch gui
 
 | 平台 | 工具与测试 |
 | --- | --- |
-| Windows | 提供 x64 独立版。Python 版支持 Windows 注册表和 Steam 安装目录探测。CI 测试 Python 3.11–3.13。 |
-| Linux | 从 wheel 或源码安装。Ubuntu 上的 CI 测试 Python 3.11–3.13。使用 GUI 需要 Tk，例如 Debian/Ubuntu 的 `python3-tk`。 |
-| macOS | Python 版可尝试从 wheel 或源码安装，需要带 Tk 的 Python 才能打开 GUI。项目目前没有 macOS CI。 |
+| Windows | 提供 x64 独立版。Python 版支持 Windows 注册表和 Steam 安装目录探测。CI 测试 Python 3.9 和 3.11–3.13。 |
+| Linux | 从 wheel 或源码安装。Ubuntu 上的 CI 测试 Python 3.9 和 3.11–3.13。使用 GUI 需要 Tk，例如 Debian/Ubuntu 的 `python3-tk`。 |
+| macOS | 从 wheel 或源码安装。CI 测试 Python 3.13。GUI 需要带 Tk 的 Python。 |
 
-Python 包要求 **3.9 或更新**，CI 目前覆盖 3.11–3.13。普通 ZIP、Tar、补丁文件和文件夹只需标准库。源码安装时可用 `python -m pip install -e ".[archive]"` 加装 `py7zr` 和 `pyzipper`，用于 7z 和 AES 加密 ZIP。RAR 支持取决于环境里的解压工具，例如 7-Zip 或 UnRAR。加密包需要提供密码。
+Python 包要求 **3.9 或更新**。普通 ZIP、Tar、补丁文件和文件夹只需标准库。源码安装时可用 `python -m pip install -e ".[archive]"` 加装 `py7zr` 和 `pyzipper`，用于 7z 和 AES 加密 ZIP。RAR 支持取决于环境里的解压工具，例如 7-Zip 或 UnRAR。加密包需要提供密码。
 
 ## 搜索与安装
 
@@ -38,22 +38,29 @@ Python 包要求 **3.9 或更新**，CI 目前覆盖 3.11–3.13。普通 ZIP、
 galpatch verify-file ./patch.zip --sha256 $publisherSha256
 galpatch apply ./patch.zip --game-dir ./MyGame --sha256 $publisherSha256 --dry-run
 galpatch apply ./patch.zip --game-dir ./MyGame --sha256 $publisherSha256
-galpatch rollback ./MyGame
+galpatch rollback ./MyGame --mode keep-patches
 ```
 
-如需强制校验本地补丁，请在安装命令同时指定 `--require-sha256` 和 `--sha256`。手动运行 `rollback` 会还原备份中的原文件并清理记录中的新增文件。安装中途报错时，自动回滚尝试撤回本轮写入。
+如需强制校验本地补丁，请在安装命令同时指定 `--require-sha256` 和 `--sha256`。安装中途报错时，自动回滚尝试撤回本轮写入。
+
+### 回滚
+
+| 命令 | 效果 |
+| --- | --- |
+| `galpatch rollback ./MyGame --mode full` | 默认模式。恢复备份中的原文件，移除已记录的新增文件。 |
+| `galpatch rollback ./MyGame --mode keep-patches` | 撤回最近一次带备份的安装，保留较早的补丁。GUI 中勾选「回滚时仅撤回最近一次安装」即可使用。 |
+| `galpatch rollback ./MyGame --history` | 查看可用的安装记录 ID 和 UTC 时间。 |
+| `galpatch rollback ./MyGame --to <记录ID>` | 撤回指定记录之后的安装，保留该记录对应的游戏状态。 |
+
+单次撤回记录从 v0.3.6 起随备份保存。旧版备份支持完整回滚。使用 `--no-backup` 完成一次安装会中断单次撤回时间线，之前的完整回滚备份仍可用。
 
 先把 `$publisherSha256` 设为从可信发布页取得的 64 位十六进制哈希。`verify-file` 也可单独用于查看本地文件信息。远程安装仅在 CLI 和 Python 库提供，默认需要预期 SHA256。下载入口拦截文件名可识别的裸可执行文件和脚本。预览可能使用临时解压目录，游戏文件保持原样。
 
-使用 `galpatch scan --only-installed --include-manual --deep` 扫描游戏，或用 `galpatch add-game "D:\Games\MyGame"` 登记非 Steam 游戏。
+使用 `galpatch scan --only-installed --include-manual --deep` 扫描游戏，或用 `galpatch add-game "D:\Games\MyGame"` 登记非 Steam 游戏。`apply`、`scan`、`auto`、`locate` 和 `rollback` 支持 `--verbose`。GUI 会将扫描提示显示在运行日志中。
 
 ### 游戏发行版示例
 
-| 补丁 | 适用游戏发行版 | 安装方式 |
-| --- | --- | --- |
-| [《千恋＊万花》v1.12 修正](https://www.yuzu-soft.com/products/senren/download.html) | 柚子社 2016 年发布，Steam 版兼容性未确认 | 解压后按官网说明运行发行商安装器 |
-| [NekoNyan 补丁](https://patches.nekonyansoft.com/) | Steam 恢复补丁仅适用于 Steam 版，部分其他商店有单独更新 | 按作品卡片确认发行版和安装方式 |
-| [07th-Mod《寒蝉》](https://wiki.07th-mod.com/Higurashi/Higurashi-Getting-started/) | 项目说明列出新版 MangaGamer 的 Steam 和 DRM-free 版本，包括 GOG | 按社区指南选择对应章节和安装方式 |
+查看[游戏发行版兼容表](docs/compatibility.md)，按游戏商店、版本及发布者的步骤选择补丁。
 
 ## 清单、开发与授权
 
