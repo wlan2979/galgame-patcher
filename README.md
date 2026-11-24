@@ -18,6 +18,8 @@ galpatch gui
 
 使用 `galpatch --version` 查看已安装的版本。
 
+`galpatch search --verbose "游戏名"` 会显示来源失败详情。使用 `--json` 时，失败提示写入标准错误流，候选列表仍按 JSON 输出。
+
 | 平台 | 工具与测试 |
 | --- | --- |
 | Windows | 提供 x64 独立版。Python 版支持 Windows 注册表和 Steam 安装目录探测。CI 测试 Python 3.11–3.13。 |
@@ -39,6 +41,8 @@ galpatch apply ./patch.zip --game-dir ./MyGame --sha256 $publisherSha256
 galpatch rollback ./MyGame
 ```
 
+如需强制校验本地补丁，请在安装命令同时指定 `--require-sha256` 和 `--sha256`。手动运行 `rollback` 会还原备份中的原文件并清理记录中的新增文件。安装中途报错时，自动回滚尝试撤回本轮写入。
+
 先把 `$publisherSha256` 设为从可信发布页取得的 64 位十六进制哈希。`verify-file` 也可单独用于查看本地文件信息。远程安装仅在 CLI 和 Python 库提供，默认需要预期 SHA256。下载入口拦截文件名可识别的裸可执行文件和脚本。预览可能使用临时解压目录，游戏文件保持原样。
 
 使用 `galpatch scan --only-installed --include-manual --deep` 扫描游戏，或用 `galpatch add-game "D:\Games\MyGame"` 登记非 Steam 游戏。
@@ -57,4 +61,6 @@ galpatch rollback ./MyGame
 - [站点来源、费用与再分发](docs/sources.md)
 - [测试与 Windows 打包](docs/development.md)
 
-本仓库不托管游戏或第三方补丁文件。搜索功能会检索并列出外部候选链接。请选用发行商发布或获授权的补丁，并遵守游戏和补丁各自的条款。本项目的代码和文档采用 [MIT 许可](LICENSE)。第三方内容依其各自的条款使用和分发。
+从 v0.3.5 起，本项目的代码和文档采用 [PolyForm Noncommercial 1.0.0](LICENSE)，商业用途须另行取得许可。个人非商业使用及许可中列明的其他用途按正文执行。分发时请附上许可条款或其网址，并保留 [版权声明](NOTICE)。
+
+v0.3.4 及更早版本按各自发布时的 MIT 许可分发。游戏、补丁和其他第三方内容各自适用原有条款，本仓库不托管游戏或第三方补丁文件。请从发行商或获授权的发布者获取补丁。

@@ -532,12 +532,23 @@ class GalgamePatcherGUI:
             self._set_status(msg, is_error=False)
             self._append_log(msg)
         elif kind == "search_done":
-            candidates, query = event[1], event[2]
+            candidates, query, failures = event[1], event[2], event[3]
             self.progress.configure(value=100)
             msg = f"在线搜索 '{query}' 完成：找到 {len(candidates)} 条候选补丁。"
-            self._set_status(msg, is_error=False)
+            sources = "、".join(dict.fromkeys(source for source, _ in failures))
+            if sources:
+                msg += f" 来源未完成：{sources}。"
+            self._set_status(msg, is_error=bool(failures))
             self._append_log(msg)
-            self._show_online_candidates_dialog(query, candidates)
+            for source, detail in failures:
+                self._append_log(f"来源未完成：{source}（{detail}）")
+            if failures and not candidates:
+                messagebox.showwarning(
+                    "搜索结果不完整",
+                    f"暂无候选结果。以下来源未完成搜索：{sources}。详情见运行日志。",
+                )
+            else:
+                self._show_online_candidates_dialog(query, candidates)
         elif kind == "success":
             msg, rescan = event[1], event[2]
             self.progress.configure(value=100)
@@ -857,8 +868,11 @@ class GalgamePatcherGUI:
 
         def _worker() -> None:
             try:
-                candidates = discover_patches_online(query)
-                self._ui_queue.put(("search_done", candidates, query))
+                failures: list[tuple[str, str]] = []
+                candidates = discover_patches_online(
+                    query, on_failure=lambda source, detail: failures.append((source, detail))
+                )
+                self._ui_queue.put(("search_done", candidates, query, failures))
             except Exception as exc:
                 logger.exception("在线搜索补丁失败")
                 self._ui_queue.put(("error", f"在线搜索补丁失败: {exc}"))
@@ -1147,10 +1161,11 @@ class GalgamePatcherGUI:
             backup_note = (
                 "已备份至 .galpatch_backup" if backup else "注意：已取消勾选自动备份"
             )
+            hash_note = "" if expected_sha256 else "\n未填写发布者的 SHA256，请确认文件来自可信来源。"
             if not messagebox.askyesno(
                 "确认安装补丁",
                 f"即将把补丁安装到游戏目录:\n{game_dir}\n\n"
-                f"将覆盖同名文件（{backup_note}）。\n确定继续吗？",
+                f"将覆盖同名文件（{backup_note}）。{hash_note}\n确定继续吗？",
             ):
                 return
 

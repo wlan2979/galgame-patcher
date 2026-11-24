@@ -15,6 +15,7 @@ from .downloader import (
     OFFICIAL_PATCH_PORTALS,
     discover_patches_online,
     get_user_sources_path,
+    is_url,
     load_user_sources,
     save_user_sources,
 )
@@ -45,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument("--steam-root", help="自定义 Steam 根目录路径")
     apply_parser.add_argument("--target-subdir", default="", help="补丁释放到游戏目录下的子目录")
     apply_parser.add_argument("--sha256", dest="expected_sha256", help="补丁文件预期 SHA256 值")
+    apply_parser.add_argument("--require-sha256", action="store_true", help="要求提供预期 SHA256")
     apply_parser.add_argument("--password", help="加密压缩包的解压密码")
     apply_parser.add_argument(
         "--try-password",
@@ -152,6 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="以 JSON 格式输出搜索结果",
     )
+
+    search_parser.add_argument("--verbose", action="store_true", help="显示各来源失败详情")
 
     # sites 子命令（补丁站点导航与自定义来源配置）
     sites_parser = subparsers.add_parser(
@@ -263,6 +267,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.game_dir and args.app_id is None and not args.game_name:
                 parser.error("请至少提供 --game-dir、--app-id 或 --game-name 之一")
 
+            if not (args.expected_sha256 or "").strip():
+                if args.require_sha256:
+                    raise ValueError("--require-sha256 需要同时提供 --sha256")
+                if not args.dry_run and not is_url(args.patch_source):
+                    print(
+                        "警告：安装本地补丁前未提供预期 SHA256，请确认文件来自可信发布者。",
+                        file=sys.stderr,
+                    )
+
             locator = SteamLocator(steam_root=args.steam_root)
             patcher = GalgamePatcher(locator=locator)
             result = patcher.apply(
@@ -368,7 +381,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0 if all_ok else 1
 
         if args.command == "search":
-            candidates = discover_patches_online(args.query)
+            failures: list[tuple[str, str]] = []
+            candidates = discover_patches_online(
+                args.query, on_failure=lambda source, detail: failures.append((source, detail))
+            )
+            if failures:
+                sources = "、".join(dict.fromkeys(source for source, _ in failures))
+                print(f"部分搜索来源未完成：{sources}。结果可能不完整。", file=sys.stderr)
+                if args.verbose:
+                    for source, detail in failures:
+                        print(f"- {source}：{detail}", file=sys.stderr)
             if args.open_index is not None:
                 if args.open_index < 1 or args.open_index > len(candidates):
                     print(

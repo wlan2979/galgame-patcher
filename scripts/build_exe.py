@@ -37,6 +37,10 @@ def main() -> int:
         str(project_root / "src"),
         "--hidden-import",
         "galgame_patcher.gui",
+        "--add-data",
+        "LICENSE:.",
+        "--add-data",
+        "NOTICE:.",
     ]
 
     for optional_pkg in ("py7zr", "pyzipper"):
