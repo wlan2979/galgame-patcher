@@ -91,6 +91,17 @@ class MetadataPolicyTests(unittest.TestCase):
             ["https://www.kaguragames.com/product/fixture-game-steam-patch/"],
         )
 
+    def test_senren_release_page_remains_available_when_robots_blocks_search(self):
+        failures = []
+        with mock.patch.object(downloader, "fetch_text", side_effect=ValueError("robots.txt HTTP 403")):
+            candidates = downloader.crawl_yuzusoft_patches(
+                "千恋万花", on_failure=lambda *event: failures.append(event)
+            )
+            self.assertEqual(downloader.crawl_yuzusoft_patches("Other Game"), [])
+        self.assertEqual(candidates[0].url, "https://www.yuzu-soft.com/products/senren/download.html")
+        self.assertTrue(candidates[0].manual_install)
+        self.assertIn("403", failures[0][1])
+
 
 class RollbackAndDiagnosticsTests(unittest.TestCase):
     def setUp(self):

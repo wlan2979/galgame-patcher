@@ -907,11 +907,17 @@ def crawl_yuzusoft_patches(
 ) -> list[OnlinePatchCandidate]:
     """从柚子社官方网站 (yuzu-soft.com/support.html) 检索官方修正补丁与支持页链接。"""
     support_url = "https://www.yuzu-soft.com/support.html"
-    html_text = fetch_text(support_url, timeout=timeout, proxies=proxies)
+    query_lower = game_query.strip().lower()
+    try:
+        html_text = fetch_text(support_url, timeout=timeout, proxies=proxies)
+    except _SEARCH_ERRORS as exc:
+        _report_search_failure("柚子社", exc, on_failure)
+        if any(alias in query_lower for alias in _YUZUSOFT_ALIASES["senren"]):
+            return [_senren_installer_candidate()]
+        return []
+
     parser = _AnchorExtractor()
     parser.feed(html_text)
-
-    query_lower = game_query.strip().lower()
     tokens = _tokenize_query(game_query)
     is_broad = (not query_lower) or any(
         k in query_lower for k in ("yuzu", "柚子", "ゆず")
