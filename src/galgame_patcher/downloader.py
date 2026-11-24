@@ -427,7 +427,7 @@ def _fetch_metadata(
                 retry_after = _retry_delay(exc)
                 if retryable and retry_after is not None:
                     delay = max(delay, retry_after)
-                    host = urllib.parse.urlsplit(exc.url or url).hostname
+                    host = urllib.parse.urlsplit(exc.geturl() or url).hostname
                     if host:
                         with _site_lock:
                             _next_request[host] = max(_next_request.get(host, 0), time.monotonic() + delay)

@@ -43,7 +43,7 @@ class MetadataPolicyTests(unittest.TestCase):
             if target.endswith("robots.txt"):
                 return io.BytesIO(b"User-agent: *\nDisallow: /private\n")
             if len(calls) == 2:
-                raise HTTPError(url, 429, "Too Many Requests", {"Retry-After": "2"}, None)
+                raise HTTPError(url, 429, "Too Many Requests", {"Retry-After": "2"}, io.BytesIO())
             return io.BytesIO(b"patches")
 
         with mock.patch.object(downloader, "open_url_request", side_effect=open_request):
@@ -58,7 +58,7 @@ class MetadataPolicyTests(unittest.TestCase):
 
         def open_request(target, **kwargs):
             calls.append((self.clock.now, kwargs["timeout"]))
-            raise HTTPError(target, 503, "Unavailable", {}, None)
+            raise HTTPError(target, 503, "Unavailable", {}, io.BytesIO())
 
         with mock.patch.object(downloader, "open_url_request", side_effect=open_request):
             with self.assertRaises(HTTPError):
