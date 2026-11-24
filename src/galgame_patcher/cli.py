@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+import traceback
 import webbrowser
 from pathlib import Path
 from typing import Optional, Sequence
@@ -20,7 +22,7 @@ from .downloader import (
     save_user_sources,
 )
 from .locator import ManualLocator, SteamLocator
-from .models import ConcurrencyError, GameRunningError, UntrustedSourceError
+from .models import GameRunningError, PatchResult
 from .patcher import GalgamePatcher, compute_sha256, inspect_patch_file
 
 
@@ -67,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument(
         "--force-locked",
         action="store_true",
-        help="跳过目标文件被占用检查（P0-2）",
+        help="跳过目标文件占用检查。游戏运行时覆盖文件可能损坏安装。",
     )
     apply_parser.add_argument(
         "--dry-run",
@@ -199,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto_parser.add_argument(
         "--force-locked",
         action="store_true",
-        help="跳过目标文件被占用检查",
+        help="跳过目标文件占用检查。游戏运行时覆盖文件可能损坏安装。",
     )
     auto_parser.add_argument(
         "--dry-run",
@@ -227,12 +229,33 @@ def build_parser() -> argparse.ArgumentParser:
     # rollback 子命令
     rollback_parser = subparsers.add_parser("rollback", help="从备份一键还原游戏目录")
     rollback_parser.add_argument("game_dir", help="需要还原的游戏安装目录")
+    rollback_parser.add_argument(
+        "--mode", choices=("full", "keep-patches"),
+        help="full 完整还原；keep-patches 仅撤回最近一次安装",
+    )
+    history_group = rollback_parser.add_mutually_exclusive_group()
+    history_group.add_argument("--history", action="store_true", help="列出安装记录和时间")
+    history_group.add_argument("--to", metavar="记录ID", help="仅撤回指定安装记录之后的安装")
+
+    for command_parser in (apply_parser, scan_parser, auto_parser, locate_parser, rollback_parser):
+        command_parser.add_argument("--verbose", action="store_true", help="显示诊断详情")
 
     # hash 子命令
     hash_parser = subparsers.add_parser("hash", help="计算补丁文件的 SHA256 校验值")
     hash_parser.add_argument("file", help="待计算哈希的文件路径")
 
     return parser
+
+
+def _report_patch_result(result: PatchResult, *, show_paths: bool = False) -> int:
+    print(result.message, file=sys.stdout if result.success else sys.stderr)
+    if result.failed_reasons:
+        print(result.failure_details(), file=sys.stderr)
+    if show_paths:
+        print(f"游戏目录: {result.game_dir}")
+        if result.backup_dir:
+            print(f"备份目录: {result.backup_dir}")
+    return 0 if result.success else 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -244,6 +267,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    verbose = args.command != "search" and getattr(args, "verbose", False)
+    logger = logging.getLogger("galgame_patcher")
+    previous_log_level = logger.level
+    handler = None
+    if verbose:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
 
     try:
         if args.command == "gui":
@@ -293,11 +325,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dry_run=args.dry_run,
                 allow_untrusted_url=args.allow_untrusted_url,
             )
-            print(result.message)
-            print(f"游戏目录: {result.game_dir}")
-            if result.backup_dir:
-                print(f"备份目录: {result.backup_dir}")
-            return 0 if result.success else 1
+            return _report_patch_result(result, show_paths=True)
 
         if args.command == "scan":
             catalog = PatchCatalog.load(args.catalog)
@@ -319,6 +347,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for item in statuses:
                 state = "已安装" if item.installed else "未安装"
                 patch_state = "已打补丁" if item.patched else "未打补丁"
+                if item.patched is None:
+                    patch_state = "补丁状态待确认"
                 app_id_text = (
                     str(item.entry.steam_app_id)
                     if item.entry.steam_app_id is not None
@@ -527,11 +557,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dry_run=args.dry_run,
                 allow_untrusted_url=args.allow_untrusted_url,
             )
-            print(result.message)
-            print(f"游戏目录: {result.game_dir}")
-            if result.backup_dir:
-                print(f"备份目录: {result.backup_dir}")
-            return 0 if result.success else 1
+            return _report_patch_result(result, show_paths=True)
 
         if args.command == "locate":
             if args.app_id is None and not args.game_name:
@@ -551,23 +577,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.command == "rollback":
             patcher = GalgamePatcher()
-            result = patcher.rollback(Path(args.game_dir))
-            print(result.message)
-            return 0 if result.success else 1
+            if args.history:
+                history = patcher.rollback_history(args.game_dir)
+                for record_id, applied_at in history:
+                    print(f"{record_id}  {applied_at}")
+                if not history:
+                    print("没有可单独撤回的安装记录。")
+                return 0
+            if args.to is not None and args.mode == "full":
+                parser.error("--to 不能与 --mode full 同用")
+            mode = "keep-patches" if args.to is not None else (args.mode or "full")
+            return _report_patch_result(patcher.rollback(args.game_dir, mode=mode, to=args.to))
 
         if args.command == "hash":
             print(compute_sha256(args.file))
             return 0
 
-    except GameRunningError as exc:
-        print(f"错误: {exc}", file=sys.stderr)
-        return 2
-    except (ConcurrencyError, UntrustedSourceError) as exc:
-        print(f"错误: {exc}", file=sys.stderr)
-        return 1
     except Exception as exc:
-        print(f"错误: {exc}", file=sys.stderr)
-        return 1
+        print(f"错误 ({args.command}): {exc}", file=sys.stderr)
+        if verbose:
+            traceback.print_exc()
+        return 2 if isinstance(exc, GameRunningError) else 1
+    finally:
+        if handler is not None:
+            logger.removeHandler(handler)
+            logger.setLevel(previous_log_level)
 
     return 0
 

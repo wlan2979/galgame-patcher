@@ -120,6 +120,7 @@ class GalgamePatcherGUI:
         self.include_manual_var = tk.BooleanVar(value=True)
         self.deep_scan_var = tk.BooleanVar(value=False)
         self.backup_var = tk.BooleanVar(value=True)
+        self.undo_latest_var = tk.BooleanVar(value=False)
 
         self.detail_name_var = tk.StringVar(value="（请在左侧选择游戏或手动指定路径）")
         self.detail_exe_var = tk.StringVar(value="-")
@@ -360,9 +361,14 @@ class GalgamePatcherGUI:
             row=0, column=3, sticky=tk.EW
         )
 
+        backup_options = ttk.Frame(right_frame)
+        backup_options.grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=4)
         ttk.Checkbutton(
-            right_frame, text="覆盖前自动备份原文件至 .galpatch_backup", variable=self.backup_var
-        ).grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=4)
+            backup_options, text="安装时保留备份", variable=self.backup_var
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(
+            backup_options, text="回滚时仅撤回最近一次安装", variable=self.undo_latest_var
+        ).pack(side=tk.LEFT)
 
         # 动作按钮栏
         action_bar = ttk.Frame(right_frame)
@@ -379,7 +385,7 @@ class GalgamePatcherGUI:
         self.btn_apply.pack(side=tk.LEFT, padx=(0, 8))
 
         self.btn_rollback = ttk.Button(
-            action_bar, text="一键卸载补丁 (还原备份)", command=self.on_rollback_clicked
+            action_bar, text="回滚补丁", command=self.on_rollback_clicked
         )
         self.btn_rollback.pack(side=tk.LEFT, padx=(0, 8))
 
@@ -621,6 +627,20 @@ class GalgamePatcherGUI:
         self._set_status("正在后台扫描本机游戏目录，请稍候...", is_error=False)
 
         def _worker() -> None:
+            warnings = set()
+            worker_id = threading.get_ident()
+            ui_queue = self._ui_queue
+
+            class ScanWarnings(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    if record.thread == worker_id:
+                        message = record.getMessage()
+                        if message not in warnings:
+                            warnings.add(message)
+                            ui_queue.put(("log", f"扫描提示: {message}"))
+
+            handler = ScanWarnings(logging.WARNING)
+            logger.addHandler(handler)
             try:
                 statuses = self.catalog.scan_games(
                     locator=self.locator,
@@ -657,10 +677,14 @@ class GalgamePatcherGUI:
                     f"扫描完成：共 {len(statuses)} 款游戏条目，"
                     f"本机已安装 {installed_count} 款。"
                 )
+                if warnings:
+                    msg += f"有 {len(warnings)} 条提示，详见运行日志。"
                 self._ui_queue.put(("scan_done", statuses, msg))
             except Exception as exc:
                 logger.exception("扫描游戏失败")
                 self._ui_queue.put(("error", str(exc)))
+            finally:
+                logger.removeHandler(handler)
 
         t = threading.Thread(target=_worker, daemon=True)
         self._active_thread = t
@@ -689,6 +713,8 @@ class GalgamePatcherGUI:
 
             if not status.installed:
                 state_text = "未安装"
+            elif status.patched is None:
+                state_text = "已安装 / 补丁状态待确认"
             elif status.patched:
                 state_text = "已安装 / 已打补丁"
             else:
@@ -1201,7 +1227,7 @@ class GalgamePatcherGUI:
                     dry_run=dry_run,
                 )
                 if not result.success:
-                    self._ui_queue.put(("error", result.message))
+                    self._ui_queue.put(("error", f"{result.message}\n{result.failure_details()}".rstrip()))
                 else:
                     self._ui_queue.put(("success", result.message, not dry_run))
             except GameRunningError as exc:
@@ -1234,10 +1260,9 @@ class GalgamePatcherGUI:
             messagebox.showwarning("缺少参数", "请先指定需要还原的游戏目录。")
             return
 
-        if not messagebox.askyesno(
-            "确认卸载补丁",
-            f"确定要从 .galpatch_backup 备份还原以下游戏目录吗？\n{game_dir}",
-        ):
+        mode = "keep-patches" if self.undo_latest_var.get() else "full"
+        action = "撤回最近一次补丁安装" if mode == "keep-patches" else "完整还原备份"
+        if not messagebox.askyesno("确认回滚", f"确定要对以下游戏{action}吗？\n{game_dir}"):
             return
 
         self._set_busy(True)
@@ -1246,11 +1271,11 @@ class GalgamePatcherGUI:
 
         def _worker() -> None:
             try:
-                result = self.patcher.rollback(game_dir)
+                result = self.patcher.rollback(game_dir, mode=mode)
                 if result.success:
                     self._ui_queue.put(("success", result.message, True))
                 else:
-                    self._ui_queue.put(("error", result.message))
+                    self._ui_queue.put(("error", f"{result.message}\n{result.failure_details()}".rstrip()))
             except GameRunningError as exc:
                 logger.warning("回滚时文件被占用: %s", exc)
                 self._ui_queue.put(("warning", "文件被占用", str(exc)))

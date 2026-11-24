@@ -94,7 +94,7 @@ class GameRunningError(RuntimeError):
         self.locked_files = list(locked_files)
         joined = "\n  ".join(self.locked_files)
         message = (
-            "以下文件正被其他程序占用，请先完全退出游戏（含 Steam 后台进程）：\n"
+            "无法以可写方式打开以下文件。请先退出游戏并检查文件权限、只读属性和杀毒软件：\n"
             f"  {joined}"
         )
         super().__init__(message)
@@ -155,6 +155,9 @@ class PatchResult:
     failed_files: list[str] = field(default_factory=list)
     failed_reasons: dict[str, str] = field(default_factory=dict)
     verified: bool = False
+
+    def failure_details(self) -> str:
+        return "\n".join(f"  {path}: {reason}" for path, reason in self.failed_reasons.items())
 
 
 @dataclass
@@ -249,7 +252,7 @@ class InstalledGameStatus:
     entry: CatalogEntry
     installed: bool
     game_dir: Optional[Path] = None
-    patched: bool = False
+    patched: Optional[bool] = False
 
 
 @dataclass

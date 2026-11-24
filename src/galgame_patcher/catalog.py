@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,8 @@ from .models import (
     OnlinePatchCandidate,
     get_appdata_dir,
 )
+
+logger = logging.getLogger("galgame_patcher")
 
 # 内置清单仅提供一个格式示例，不收录任何具体作品或补丁链接。
 DEFAULT_CATALOG_ENTRIES: list[dict[str, Any]] = [
@@ -34,16 +37,22 @@ DEFAULT_CATALOG_ENTRIES: list[dict[str, Any]] = [
 ]
 
 
-def _is_game_patched(game_dir: Path) -> bool:
-    """检查游戏目录是否存在有效（非 rolled_back）的补丁备份清单。"""
+def _is_game_patched(game_dir: Path) -> Optional[bool]:
+    """检查补丁清单，无法确认状态时返回 None。"""
     manifest_path = game_dir / ".galpatch_backup" / "manifest.json"
     if not manifest_path.is_file():
         return False
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("备份清单根节点应为对象")
+        if data.get("status") == "in_progress":
+            logger.warning("检测到未完成的补丁安装，请检查备份清单: %s", manifest_path)
+            return None
         return data.get("status") != "rolled_back"
-    except (OSError, json.JSONDecodeError):
-        return True
+    except (OSError, ValueError) as exc:
+        logger.warning("无法确认补丁状态，请检查备份清单 %s: %s", manifest_path, exc)
+        return None
 
 
 class PatchCatalog:
@@ -70,8 +79,8 @@ class PatchCatalog:
         if storage.is_file():
             try:
                 return cls.from_file(storage)
-            except Exception:
-                pass
+            except (OSError, TypeError, ValueError, KeyError) as exc:
+                logger.warning("无法加载本地补丁清单 %s，已使用内置清单: %s", storage, exc)
         return cls.from_dict({"version": 1, "games": DEFAULT_CATALOG_ENTRIES}, default_source="builtin")
 
     @classmethod
