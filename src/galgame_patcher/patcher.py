@@ -26,6 +26,7 @@ from .models import (
     ConcurrencyError,
     GameProfile,
     GameRunningError,
+    InstallStatus,
     PatchFileInspection,
     PatchResult,
     UntrustedSourceError,
@@ -405,9 +406,18 @@ class GalgamePatcher:
         )
 
     def rollback(
-        self, game_dir: Union[str, Path], *, mode: str = "full", to: Optional[str] = None
+        self,
+        game_dir: Union[str, Path],
+        *,
+        mode: str = "full",
+        to: Optional[str] = None,
+        expected_status: Optional[str] = None,
     ) -> PatchResult:
-        """完整还原，或撤回安装至指定记录（默认撤回最近一次）。"""
+        """完整还原，或撤回安装至指定记录（默认撤回最近一次）。
+
+        expected_status 用于调用方要求清单处于特定状态（例如恢复中断安装时要求 in_progress），
+        若加锁后状态已变化则取消回滚，避免误回滚刚完成的安装。
+        """
         if mode not in ("full", "keep-patches"):
             raise ValueError(f"未知的回滚模式: {mode}")
         if to is not None and mode != "keep-patches":
@@ -425,6 +435,11 @@ class GalgamePatcher:
                 raise FileNotFoundError(f"未找到补丁备份清单: {manifest_path}")
             manifest = self._read_backup_manifest(manifest_path)
             status = manifest.get("status", "committed")
+            if expected_status is not None and status != expected_status:
+                raise ValueError(
+                    f"当前安装状态为 {status!r}，与预期的 {expected_status!r} 不符，"
+                    "已取消本次回滚；请先查看 galpatch status"
+                )
             if mode == "keep-patches":
                 if status == "in_progress":
                     raise ValueError("检测到未完成的安装，请先执行完整回滚")
@@ -585,6 +600,80 @@ class GalgamePatcher:
             history.append((snapshot_dir.name, journal["applied_at"]))
             manifest = journal["previous_manifest"] or {}
         return history
+
+    def install_status(self, game_dir: Union[str, Path]) -> InstallStatus:
+        """读取备份清单，返回游戏目录当前的补丁安装状态（不修改任何文件）。"""
+        resolved = Path(game_dir).resolve()
+        if not resolved.is_dir():
+            raise FileNotFoundError(f"游戏目录不存在: {resolved}")
+
+        backup_root = resolved / self.BACKUP_FOLDER_NAME
+        manifest_path = backup_root / "manifest.json"
+        status = InstallStatus(
+            game_dir=resolved,
+            state="not_installed",
+            manifest_path=manifest_path if manifest_path.is_file() else None,
+        )
+        if not manifest_path.is_file():
+            return status
+
+        try:
+            manifest = self._read_backup_manifest(manifest_path)
+        except ValueError as exc:
+            status.state = "invalid"
+            status.message = str(exc)
+            return status
+
+        raw_state = manifest.get("status", "committed")
+        if raw_state == "in_progress":
+            status.state = "incomplete"
+        elif raw_state == "rolled_back":
+            status.state = "rolled_back"
+        elif raw_state == "committed":
+            status.state = "installed"
+        else:
+            status.state = "invalid"
+            status.message = f"备份清单包含未知状态: {raw_state!r}"
+
+        latest = manifest.get("latest_install")
+        if (
+            isinstance(latest, str)
+            and latest.startswith("install-")
+            and Path(latest).name == latest
+        ):
+            status.latest_install = latest
+            try:
+                journal = json.loads(
+                    (backup_root / latest / "undo.json").read_text(encoding="utf-8")
+                )
+                if isinstance(journal, dict):
+                    status.applied_at = str(journal.get("applied_at") or "")
+            except (OSError, ValueError):
+                pass
+
+        status.backed_up_files = len(manifest.get("backed_up_files", []))
+        status.newly_added_files = len(manifest.get("newly_added_files", []))
+        raw_created = manifest.get("created_dirs")
+        if isinstance(raw_created, list):
+            status.created_dirs = len(raw_created)
+
+        if status.state == "installed":
+            try:
+                status.history = self._read_rollback_history(backup_root, manifest)
+            except (OSError, ValueError) as exc:
+                status.message = f"安装历史不可读: {exc}"
+        return status
+
+    def recover_incomplete_install(self, game_dir: Union[str, Path]) -> PatchResult:
+        """回滚上次未完成的安装；只在状态仍为 in_progress 时执行。"""
+        status = self.install_status(game_dir)
+        if status.state != "incomplete":
+            raise ValueError(
+                f"当前状态为「{status.state_label}」，没有需要恢复的未完成安装"
+            )
+        return self.rollback(
+            status.game_dir, mode="full", expected_status="in_progress"
+        )
 
     def _read_install_journal(self, backup_root: Path, manifest: dict) -> tuple[Path, dict]:
         latest = manifest.get("latest_install")
@@ -810,7 +899,11 @@ class GalgamePatcher:
             if manifest_path.is_file():
                 old_manifest = self._read_backup_manifest(manifest_path)
                 if old_manifest.get("status") == "in_progress":
-                    raise ValueError("上次安装未完成，请先回滚后重试")
+                    raise ValueError(
+                        "上次安装未完成，请先回滚后重试"
+                        "（完整回滚：galpatch recover <游戏目录>，"
+                        "或 GUI 的『恢复未完成安装』）"
+                    )
                 if old_manifest and old_manifest.get("status") != "rolled_back":
                     previous_manifest = old_manifest
                     existing_backed_up.update(old_manifest.get("backed_up_files", []))

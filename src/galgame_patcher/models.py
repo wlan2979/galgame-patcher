@@ -276,6 +276,53 @@ class InstalledGameStatus:
     patched: Optional[bool] = False
 
 
+INSTALL_STATE_LABELS: dict[str, str] = {
+    "not_installed": "未安装补丁",
+    "installed": "已安装补丁",
+    "incomplete": "上次安装未完成",
+    "rolled_back": "已回滚",
+    "invalid": "备份清单损坏",
+}
+
+
+@dataclass
+class InstallStatus:
+    """描述某个游戏目录当前的补丁安装状态，供状态查询与中断恢复使用。"""
+
+    game_dir: Path
+    state: str
+    manifest_path: Optional[Path] = None
+    latest_install: str = ""
+    applied_at: str = ""
+    backed_up_files: int = 0
+    newly_added_files: int = 0
+    created_dirs: int = 0
+    history: list[tuple[str, str]] = field(default_factory=list)
+    message: str = ""
+
+    @property
+    def state_label(self) -> str:
+        return INSTALL_STATE_LABELS.get(self.state, self.state)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "game_dir": str(self.game_dir),
+            "state": self.state,
+            "state_label": self.state_label,
+            "manifest_path": str(self.manifest_path) if self.manifest_path else None,
+            "latest_install": self.latest_install,
+            "applied_at": self.applied_at,
+            "backed_up_files": self.backed_up_files,
+            "newly_added_files": self.newly_added_files,
+            "created_dirs": self.created_dirs,
+            "history": [
+                {"id": record_id, "applied_at": applied_at}
+                for record_id, applied_at in self.history
+            ],
+            "message": self.message,
+        }
+
+
 @dataclass
 class PatchFileInspection:
     """本地补丁文件核验结果，用于在安装前向用户展示体积、时间与 SHA256 摘要。"""

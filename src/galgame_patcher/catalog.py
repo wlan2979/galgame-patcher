@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -222,6 +223,67 @@ class PatchCatalog:
         self.version = remote_catalog.version
         self.save_to_file(storage_path)
         return True
+
+    _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+
+    def validate(self) -> tuple[list[str], list[str]]:
+        """检查清单条目，返回 (错误列表, 警告列表)；错误会阻止保存。"""
+        errors: list[str] = []
+        warnings: list[str] = []
+        seen_ids: set[str] = set()
+
+        for index, entry in enumerate(self.entries, start=1):
+            label = f"条目 #{index} [{entry.id.strip() or '无 id'}]"
+            entry_id = entry.id.strip()
+            if not entry_id:
+                errors.append(f"{label}: id 不能为空")
+            elif entry_id in seen_ids:
+                errors.append(f"{label}: id 与其他条目重复")
+            else:
+                seen_ids.add(entry_id)
+
+            if not entry.name.strip():
+                errors.append(f"{label}: name 不能为空")
+
+            if entry.steam_app_id is not None and entry.steam_app_id <= 0:
+                errors.append(f"{label}: steam_app_id 必须为正整数")
+
+            for field_name, value in (
+                ("install_dir_name", entry.install_dir_name),
+                ("executable_name", entry.executable_name),
+            ):
+                if value and ("/" in value or "\\" in value):
+                    errors.append(f"{label}: {field_name} 不能包含路径分隔符")
+
+            subdir = entry.target_subdir.strip()
+            if subdir:
+                sub_path = Path(subdir)
+                if (
+                    sub_path.is_absolute()
+                    or sub_path.drive
+                    or ".." in sub_path.parts
+                ):
+                    errors.append(
+                        f"{label}: target_subdir 必须是游戏目录内的相对路径"
+                    )
+
+            url = entry.patch_url.strip()
+            if url:
+                if not url.lower().startswith(("http://", "https://")):
+                    errors.append(f"{label}: patch_url 必须是 http(s) 链接")
+                elif not entry.expected_sha256:
+                    warnings.append(
+                        f"{label}: 未配置 expected_sha256，远程补丁内容无法核验"
+                    )
+
+            if entry.expected_sha256 and not self._SHA256_PATTERN.match(
+                entry.expected_sha256.strip()
+            ):
+                errors.append(
+                    f"{label}: expected_sha256 必须是 64 位十六进制字符串"
+                )
+
+        return errors, warnings
 
     def verify_links(
         self, *, timeout: float = 10.0
