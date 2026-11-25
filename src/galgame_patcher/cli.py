@@ -22,7 +22,7 @@ from .downloader import (
     save_user_sources,
 )
 from .locator import ManualLocator, SteamLocator
-from .models import GameRunningError, PatchResult
+from .models import CatalogEntry, GameRunningError, PatchResult
 from .patcher import GalgamePatcher, compute_sha256, inspect_patch_file
 
 
@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # catalog 子命令（P2-2: update / list / verify）
     catalog_parser = subparsers.add_parser(
-        "catalog", help="管理补丁源清单（远程更新、列表查看、链接探活）"
+        "catalog", help="管理补丁源清单（编辑条目、校验、远程更新、列表查看、链接探活）"
     )
     catalog_sub = catalog_parser.add_subparsers(
         dest="catalog_action", required=True
@@ -136,6 +136,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     cat_verify = catalog_sub.add_parser("verify", help="对清单中的每个补丁链接发起 HEAD 请求探活")
     cat_verify.add_argument("--catalog", help="清单文件路径或远程 URL")
+
+    cat_add = catalog_sub.add_parser("add", help="新增或更新清单条目（按 id 覆盖）")
+    cat_add.add_argument("--id", required=True, help="条目唯一 ID，例如 game_name")
+    cat_add.add_argument("--name", required=True, help="游戏名称")
+    cat_add.add_argument("--url", help="补丁下载链接（http/https）")
+    cat_add.add_argument("--sha256", help="补丁文件预期 SHA256（64 位十六进制）")
+    cat_add.add_argument("--password", help="加密压缩包的解压密码")
+    cat_add.add_argument("--app-id", type=int, help="Steam AppID")
+    cat_add.add_argument("--install-dir", help="Steam 安装目录名")
+    cat_add.add_argument("--executable", help="游戏主程序文件名")
+    cat_add.add_argument("--subdir", dest="target_subdir", help="补丁写入的子目录")
+    cat_add.add_argument("--patch-version", help="补丁版本号（默认 1.0）")
+    cat_add.add_argument("--description", help="补丁说明")
+    cat_add.add_argument(
+        "--catalog", help="要编辑的本地清单文件路径（默认 %APPDATA%\\galgame-patcher\\catalog.json）"
+    )
+
+    cat_remove = catalog_sub.add_parser("remove", help="按 id 删除清单条目")
+    cat_remove.add_argument("entry_id", help="要删除的条目 ID")
+    cat_remove.add_argument("--catalog", help="要编辑的本地清单文件路径")
+
+    cat_validate = catalog_sub.add_parser("validate", help="检查清单格式与条目字段")
+    cat_validate.add_argument("--catalog", help="清单文件路径或远程 URL")
 
     # search 子命令（只列出链接，不下载文件）
     search_parser = subparsers.add_parser(
@@ -237,7 +260,29 @@ def build_parser() -> argparse.ArgumentParser:
     history_group.add_argument("--history", action="store_true", help="列出安装记录和时间")
     history_group.add_argument("--to", metavar="记录ID", help="仅撤回指定安装记录之后的安装")
 
-    for command_parser in (apply_parser, scan_parser, auto_parser, locate_parser, rollback_parser):
+    # status 子命令
+    status_parser = subparsers.add_parser("status", help="查看游戏目录当前的补丁安装状态")
+    status_parser.add_argument("game_dir", help="游戏安装目录")
+    status_parser.add_argument(
+        "--json", dest="json_output", action="store_true", help="以 JSON 格式输出状态"
+    )
+
+    # recover 子命令
+    recover_parser = subparsers.add_parser(
+        "recover", help="恢复上次中断的补丁安装（完整回滚残留改动）"
+    )
+    recover_parser.add_argument("game_dir", help="游戏安装目录")
+    recover_parser.add_argument("--yes", action="store_true", help="跳过交互确认")
+
+    for command_parser in (
+        apply_parser,
+        scan_parser,
+        auto_parser,
+        locate_parser,
+        rollback_parser,
+        status_parser,
+        recover_parser,
+    ):
         command_parser.add_argument("--verbose", action="store_true", help="显示诊断详情")
 
     # hash 子命令
@@ -256,6 +301,80 @@ def _report_patch_result(result: PatchResult, *, show_paths: bool = False) -> in
         if result.backup_dir:
             print(f"备份目录: {result.backup_dir}")
     return 0 if result.success else 1
+
+
+def _editable_catalog(source: Optional[str]) -> tuple[PatchCatalog, Path]:
+    """加载可编辑的本地清单；未指定路径且默认文件不存在时从空白清单开始。"""
+    if source and is_url(source):
+        raise ValueError("catalog add/remove 只支持本地清单文件，不能直接编辑远程 URL")
+    path = Path(source) if source else PatchCatalog.default_storage_path()
+    if path.is_file():
+        return PatchCatalog.from_file(path), path
+    # 显式指定的新路径也允许从空白清单开始，方便首次创建。
+    return PatchCatalog(entries=[]), path
+
+
+def _handle_catalog_edit(args: argparse.Namespace) -> int:
+    """处理 catalog add / remove / validate。"""
+    if args.catalog_action == "validate":
+        catalog = PatchCatalog.load(args.catalog)
+        errors, warnings = catalog.validate()
+        for warning in warnings:
+            print(f"警告: {warning}")
+        for error in errors:
+            print(f"错误: {error}", file=sys.stderr)
+        print(
+            f"清单共 {len(catalog.entries)} 条："
+            f"{len(errors)} 个错误，{len(warnings)} 个警告。"
+        )
+        return 0 if not errors else 1
+
+    catalog, path = _editable_catalog(args.catalog)
+
+    if args.catalog_action == "remove":
+        entry_id = args.entry_id.strip()
+        remaining = [entry for entry in catalog.entries if entry.id != entry_id]
+        if len(remaining) == len(catalog.entries):
+            print(f"未找到条目: {entry_id}", file=sys.stderr)
+            return 1
+        catalog.entries = remaining
+        saved = catalog.save_to_file(path)
+        print(f"已删除条目 {entry_id}，清单已保存: {saved}（剩余 {len(remaining)} 条）")
+        return 0
+
+    entry_id = args.id.strip()
+    entry = next((item for item in catalog.entries if item.id == entry_id), None)
+    if entry is None:
+        entry = CatalogEntry(id=entry_id, name=args.name, source="user")
+        catalog.entries.append(entry)
+    entry.name = args.name
+    optional_fields = {
+        "patch_url": args.url,
+        "expected_sha256": args.sha256,
+        "archive_password": args.password,
+        "steam_app_id": args.app_id,
+        "install_dir_name": args.install_dir,
+        "executable_name": args.executable,
+        "target_subdir": args.target_subdir,
+        "patch_version": args.patch_version,
+        "description": args.description,
+    }
+    for field_name, value in optional_fields.items():
+        if value is not None:
+            setattr(entry, field_name, value)
+
+    errors, warnings = catalog.validate()
+    for error in errors:
+        print(f"错误: {error}", file=sys.stderr)
+    if errors:
+        print("清单未保存，请修正上述错误后重试。", file=sys.stderr)
+        return 1
+
+    saved = catalog.save_to_file(path)
+    print(f"已保存清单: {saved}（共 {len(catalog.entries)} 条）")
+    for warning in warnings:
+        print(f"警告: {warning}", file=sys.stderr)
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -375,6 +494,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
 
         if args.command == "catalog":
+            if args.catalog_action in ("add", "remove", "validate"):
+                return _handle_catalog_edit(args)
+
             catalog = PatchCatalog.load(getattr(args, "catalog", None))
             if args.catalog_action == "list":
                 print(f"清单版本: v{catalog.version} (共 {len(catalog.entries)} 条)")
@@ -592,6 +714,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 parser.error("--to 不能与 --mode full 同用")
             mode = "keep-patches" if args.to is not None else (args.mode or "full")
             return _report_patch_result(patcher.rollback(args.game_dir, mode=mode, to=args.to))
+
+        if args.command == "status":
+            status = GalgamePatcher().install_status(args.game_dir)
+            if args.json_output:
+                print(json.dumps(status.to_dict(), ensure_ascii=False, indent=2))
+                return 0
+            print(f"游戏目录: {status.game_dir}")
+            print(f"状态: {status.state_label}")
+            if status.manifest_path:
+                print(f"备份清单: {status.manifest_path}")
+            if status.latest_install:
+                applied = f"，安装时间 {status.applied_at}" if status.applied_at else ""
+                print(f"最近安装: {status.latest_install}{applied}")
+            if status.state in ("installed", "incomplete"):
+                print(
+                    f"备份内容: 原文件 {status.backed_up_files} 个，"
+                    f"新增文件 {status.newly_added_files} 个，"
+                    f"新建目录 {status.created_dirs} 个"
+                )
+            if status.history:
+                print("安装历史（最近在前）:")
+                for record_id, applied_at in status.history:
+                    print(f"  {record_id}  {applied_at or '-'}")
+            if status.message:
+                print(f"说明: {status.message}")
+            if status.state == "incomplete":
+                print("可执行 galpatch recover <游戏目录> 回滚残留改动。")
+            return 0
+
+        if args.command == "recover":
+            patcher = GalgamePatcher()
+            status = patcher.install_status(args.game_dir)
+            if status.state == "invalid":
+                print(
+                    f"备份清单损坏，无法自动恢复: {status.manifest_path}\n{status.message}",
+                    file=sys.stderr,
+                )
+                return 1
+            if status.state != "incomplete":
+                print(f"当前状态为「{status.state_label}」，无需恢复。")
+                return 0
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    raise ValueError("非交互环境无法确认，请加 --yes 后重试")
+                try:
+                    answer = input(
+                        f"将完整回滚 {status.game_dir} 中未完成的安装，是否继续? [y/N] "
+                    )
+                except EOFError as exc:
+                    raise ValueError("未收到确认输入，请加 --yes 后重试") from exc
+                if answer.strip().lower() not in ("y", "yes"):
+                    print("已取消。")
+                    return 0
+            return _report_patch_result(
+                patcher.recover_incomplete_install(args.game_dir), show_paths=True
+            )
 
         if args.command == "hash":
             print(compute_sha256(args.file))

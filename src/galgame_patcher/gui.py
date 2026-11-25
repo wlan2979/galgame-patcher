@@ -128,6 +128,7 @@ class GalgamePatcherGUI:
         self.detail_name_var = tk.StringVar(value="（请在左侧选择游戏或手动指定路径）")
         self.detail_exe_var = tk.StringVar(value="-")
         self.detail_desc_var = tk.StringVar(value="-")
+        self.detail_state_var = tk.StringVar(value="补丁状态: -")
         self.game_dir_var = tk.StringVar(
             value=str(self._gui_config.get("last_game_dir") or "")
         )
@@ -138,10 +139,10 @@ class GalgamePatcherGUI:
         self.status_var = tk.StringVar(
             value="就绪：支持扫描 Steam / 本地游戏、自动上网爬取补丁或按 Ctrl+V 粘贴补丁路径。"
         )
-        # 手动改游戏目录时清空上一条清单条目遗留的目标子目录，避免补丁写进错误的文件夹。
-        self.game_dir_var.trace_add("write", self._on_game_dir_var_changed)
-
         self._build_ui()
+        # 手动改游戏目录时清空上一条清单条目遗留的目标子目录，并刷新补丁状态。
+        self.game_dir_var.trace_add("write", self._on_game_dir_var_changed)
+        self._refresh_install_state()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Control-v>", self._on_paste_shortcut)
         self.root.bind("<Control-V>", self._on_paste_shortcut)
@@ -175,6 +176,8 @@ class GalgamePatcherGUI:
     def _on_game_dir_var_changed(self, *_args: object) -> None:
         if self.target_subdir_var.get():
             self.target_subdir_var.set("")
+        if hasattr(self, "btn_recover"):
+            self._refresh_install_state()
 
     def _on_close(self) -> None:
         """关闭窗口；若正在写补丁则等待写完，避免留下半截文件。"""
@@ -311,9 +314,17 @@ class GalgamePatcherGUI:
         ttk.Label(right_frame, text="补丁说明:").grid(
             row=2, column=0, sticky=tk.W, pady=3, padx=(0, 8)
         )
+        desc_frame = ttk.Frame(right_frame)
+        desc_frame.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=3)
         ttk.Label(
-            right_frame, textvariable=self.detail_desc_var, wraplength=420
-        ).grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=3)
+            desc_frame, textvariable=self.detail_desc_var, wraplength=420
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            desc_frame,
+            textvariable=self.detail_state_var,
+            foreground="#1b5e20",
+            wraplength=420,
+        ).pack(anchor=tk.W, pady=(2, 0))
 
         ttk.Separator(right_frame, orient=tk.HORIZONTAL).grid(
             row=3, column=0, columnspan=3, sticky=tk.EW, pady=8
@@ -424,6 +435,14 @@ class GalgamePatcherGUI:
             action_bar, text="回滚补丁", command=self.on_rollback_clicked
         )
         self.btn_rollback.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_recover = ttk.Button(
+            action_bar,
+            text="恢复未完成安装",
+            command=self.on_recover_clicked,
+            state=tk.DISABLED,
+        )
+        self.btn_recover.pack(side=tk.LEFT, padx=(0, 8))
 
         self.btn_open_dir = ttk.Button(
             action_bar, text="打开游戏目录", command=self.open_game_dir
@@ -544,6 +563,8 @@ class GalgamePatcherGUI:
             self.btn_rollback,
         ):
             btn.configure(state=state)
+        # 恢复按钮只在「上次安装未完成」且空闲时可用，由状态刷新统一决定。
+        self._refresh_install_state()
 
     def _poll_queue(self) -> None:
         """轮询后台事件，记录单个事件的错误并继续处理其余事件。"""
@@ -842,6 +863,36 @@ class GalgamePatcherGUI:
         self.password_var.set(entry.archive_password or "")
         self.sha256_var.set(entry.expected_sha256 or "")
         self.target_subdir_var.set(entry.target_subdir or "")
+
+    def _refresh_install_state(self) -> None:
+        """同步显示当前游戏目录的补丁状态，并控制「恢复未完成安装」按钮是否可用。"""
+        game_dir = self.game_dir_var.get().strip()
+        if not game_dir or not Path(game_dir).is_dir():
+            self.detail_state_var.set("补丁状态: -")
+            self.btn_recover.configure(state=tk.DISABLED)
+            return
+        try:
+            status = self.patcher.install_status(game_dir)
+        except Exception as exc:
+            logger.warning("读取补丁安装状态失败: %s", exc)
+            self.detail_state_var.set(f"补丁状态: 读取失败（{exc}）")
+            self.btn_recover.configure(state=tk.DISABLED)
+            return
+
+        text = f"补丁状态: {status.state_label}"
+        if status.latest_install:
+            applied = f"（{status.applied_at}）" if status.applied_at else ""
+            text += f" — {status.latest_install}{applied}"
+        if status.state == "incomplete":
+            text += "，可点击「恢复未完成安装」回滚残留改动"
+        self.detail_state_var.set(text)
+        self.btn_recover.configure(
+            state=(
+                tk.NORMAL
+                if status.state == "incomplete" and not self._busy
+                else tk.DISABLED
+            )
+        )
 
     def register_manual_game(self) -> None:
         """手工选择并登记非 Steam 游戏目录到 %APPDATA%\\galgame-patcher\\games.json（P2-1）。"""
@@ -1394,14 +1445,51 @@ class GalgamePatcherGUI:
         if not messagebox.askyesno("确认回滚", f"确定要对以下游戏{action}吗？\n{game_dir}"):
             return
 
+        self._start_rollback_task(
+            game_dir, mode=mode, status_text="正在还原备份文件，请稍候..."
+        )
+
+    def on_recover_clicked(self) -> None:
+        """恢复上次中断的安装：完整回滚残留改动。"""
+        if self._busy:
+            return
+        game_dir = self.game_dir_var.get().strip()
+        if not game_dir:
+            messagebox.showwarning("缺少参数", "请先指定需要恢复的游戏目录。")
+            return
+        if not messagebox.askyesno(
+            "确认恢复",
+            f"将完整回滚以下游戏目录中上次未完成的补丁安装：\n{game_dir}\n\n"
+            "已经写入的新增文件会被删除，被覆盖的文件会从备份还原。",
+        ):
+            return
+
+        self._start_rollback_task(
+            game_dir,
+            mode="full",
+            status_text="正在恢复未完成的安装，请稍候...",
+            recover=True,
+        )
+
+    def _start_rollback_task(
+        self,
+        game_dir: str,
+        *,
+        mode: str,
+        status_text: str,
+        recover: bool = False,
+    ) -> None:
         self._set_busy(True)
         self._install_active = True
         self.progress.configure(value=10)
-        self._set_status("正在还原备份文件，请稍候...", is_error=False)
+        self._set_status(status_text, is_error=False)
 
         def _worker() -> None:
             try:
-                result = self.patcher.rollback(game_dir, mode=mode)
+                if recover:
+                    result = self.patcher.recover_incomplete_install(game_dir)
+                else:
+                    result = self.patcher.rollback(game_dir, mode=mode)
                 if result.success:
                     self._ui_queue.put(("success", result.message, True))
                 else:

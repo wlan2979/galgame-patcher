@@ -28,11 +28,25 @@
 ```
 
 ```bash
+galpatch catalog validate --catalog ./my_catalog.json
 galpatch catalog list --catalog ./my_catalog.json
 galpatch catalog verify --catalog ./my_catalog.json
 galpatch auto my_game --catalog ./my_catalog.json --game-dir ./MyGame --dry-run
 galpatch auto my_game --catalog ./my_catalog.json --game-dir ./MyGame
 ```
+
+也可以用命令逐条维护清单，不必手写 JSON。`catalog add` 按 `id` 新增或覆盖条目；省略的可选字段会保留原值：
+
+```bash
+galpatch catalog add --catalog ./my_catalog.json \
+  --id my_game --name "示例游戏" --app-id 123456 \
+  --url "https://example.com/official/my_game_update_1.2.zip" \
+  --sha256 $publisherSha256 --patch-version 1.2 \
+  --description "Steam 版 / 简体中文 / 覆盖安装"
+galpatch catalog remove my_game --catalog ./my_catalog.json
+```
+
+`catalog validate` 检查空或重复的 id、缺少名称、非 http(s) 链接、无效 SHA256、越界的 `target_subdir` 以及含路径分隔符的安装目录名或主程序名；发现错误时返回非零状态码。远程链接缺少 `expected_sha256` 只给出警告。`catalog add` 保存前执行同一套校验，有错误时不会写入文件。`add` 与 `remove` 只编辑本地清单，不接受远程 URL 作为 `--catalog`。
 
 `catalog verify` 检查链接能否响应 HEAD 请求；不支持 HEAD 的站点会自动改用只取首字节的 GET 复检。站点可能限制自动请求，状态异常时可在浏览器中核对发布页。`auto` 会比对补丁文件的 SHA256。`patch_version` 是补丁的版本说明，游戏构建版本需由使用者核对。安装器类补丁请依照发布者的安装说明。
 
@@ -54,3 +68,5 @@ print(preview.message)
 直接安装本地文件可调用 `apply_patch("./patch.zip", game_dir="./MyGame")`。安装前可传入 `expected_sha256`，也可对加密包传入 `password`。
 
 调用 `rollback_patch("./MyGame")` 完整回滚，或传入 `mode="keep-patches"` 撤回最近一次安装。用 `GalgamePatcher().rollback_history("./MyGame")` 查询记录 ID 和 UTC 时间，再用 `rollback_patch("./MyGame", mode="keep-patches", to=record_id)` 恢复到某次安装完成后的状态。扫描结果的 `patched` 为 `None` 时，备份清单需要检查。
+
+查询状态可调用 `GalgamePatcher().install_status("./MyGame")`，返回 `InstallStatus`，其 `state` 为 `not_installed`、`installed`、`incomplete`、`rolled_back` 或 `invalid`。若上次安装中断（`incomplete`），调用 `recover_incomplete_install("./MyGame")` 完整回滚残留改动；它在加锁后再次确认清单仍为 `in_progress`，状态已变化时不会执行回滚。

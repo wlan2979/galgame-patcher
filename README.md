@@ -51,12 +51,14 @@ galpatch rollback ./MyGame --mode keep-patches
 | `galpatch rollback ./MyGame --mode keep-patches` | 撤回最近一次带备份的安装，保留较早的补丁。GUI 中勾选「回滚时仅撤回最近一次安装」即可使用。 |
 | `galpatch rollback ./MyGame --history` | 查看可用的安装记录 ID 和 UTC 时间。 |
 | `galpatch rollback ./MyGame --to <记录ID>` | 撤回指定记录之后的安装，保留该记录对应的游戏状态。 |
+| `galpatch status ./MyGame` | 查看补丁状态、备份清单、最近安装时间与安装历史；加 `--json` 输出机器可读结果。 |
+| `galpatch recover ./MyGame` | 上次安装被中断时，完整回滚残留改动；确认后执行，非交互环境加 `--yes`。 |
 
-单次撤回记录从 v0.3.6 起随备份保存。旧版备份支持完整回滚。使用 `--no-backup` 完成一次安装会中断单次撤回时间线，之前的完整回滚备份仍可用。
+单次撤回记录从 v0.3.6 起随备份保存。旧版备份支持完整回滚。使用 `--no-backup` 完成一次安装会中断单次撤回时间线，之前的完整回滚备份仍可用。若安装中途退出，`status` 会显示「上次安装未完成」，此时 `recover` 和 GUI 的「恢复未完成安装」可清理残留；继续安装前必须先回滚。
 
 先把 `$publisherSha256` 设为从可信发布页取得的 64 位十六进制哈希。`verify-file` 也可单独用于查看本地文件信息。远程安装仅在 CLI 和 Python 库提供，默认需要预期 SHA256。下载入口拦截文件名可识别的裸可执行文件和脚本。预览可能使用临时解压目录，游戏文件保持原样。
 
-使用 `galpatch scan --only-installed --include-manual --deep` 扫描游戏，或用 `galpatch add-game "D:\Games\MyGame"` 登记非 Steam 游戏。`apply`、`scan`、`auto`、`locate` 和 `rollback` 支持 `--verbose`。GUI 会将扫描提示显示在运行日志中。
+使用 `galpatch scan --only-installed --include-manual --deep` 扫描游戏，或用 `galpatch add-game "D:\Games\MyGame"` 登记非 Steam 游戏。`apply`、`scan`、`auto`、`locate`、`rollback`、`status` 和 `recover` 支持 `--verbose`。GUI 会将扫描提示显示在运行日志中。
 
 ### 游戏发行版示例
 
