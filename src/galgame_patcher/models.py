@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Union
 
 COMMON_PATCH_EXTENSIONS: tuple[str, ...] = (
     ".xp3",
@@ -72,6 +73,24 @@ BARE_EXECUTABLE_SUFFIXES: tuple[str, ...] = (
     ".com",
     ".jar",
 )
+
+
+def file_sha256(
+    file_path: Union[str, Path], *, chunk_size: int = 1024 * 1024
+) -> str:
+    """分块计算文件 SHA256 十六进制摘要（小写），文件不存在时抛出 FileNotFoundError。"""
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"无法计算 SHA256，文件不存在: {path}")
+
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest().lower()
 
 
 def get_appdata_dir() -> Path:
@@ -226,9 +245,9 @@ class CatalogEntry:
             source=str(data.get("source") or default_source),
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        """序列化为可保存为 JSON 的字典。"""
-        return {
+    def to_dict(self, *, include_password: bool = True) -> dict[str, Any]:
+        """序列化为可保存为 JSON 的字典；导出分享时可关闭密码字段。"""
+        payload: dict[str, Any] = {
             "id": self.id,
             "name": self.name,
             "steam_app_id": self.steam_app_id,
@@ -237,12 +256,14 @@ class CatalogEntry:
             "patch_url": self.patch_url,
             "patch_version": self.patch_version,
             "expected_sha256": self.expected_sha256,
-            "archive_password": self.archive_password,
             "target_subdir": self.target_subdir,
             "description": self.description,
             "last_verified": self.last_verified,
             "source": self.source,
         }
+        if include_password:
+            payload["archive_password"] = self.archive_password
+        return payload
 
 
 @dataclass

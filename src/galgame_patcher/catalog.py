@@ -9,12 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-from .downloader import check_url_head, discover_patches_online, fetch_json
+from .downloader import check_url_head, fetch_json
 from .locator import ManualLocator, SteamLocator, deep_scan_games
 from .models import (
     CatalogEntry,
     InstalledGameStatus,
-    OnlinePatchCandidate,
     get_appdata_dir,
 )
 
@@ -79,7 +78,7 @@ class PatchCatalog:
         if storage.is_file():
             try:
                 return cls.from_file(storage)
-            except (OSError, TypeError, ValueError, KeyError) as exc:
+            except (OSError, TypeError, ValueError, KeyError, AttributeError) as exc:
                 logger.warning("无法加载本地补丁清单 %s，已使用内置清单: %s", storage, exc)
         return cls.from_dict({"version": 1, "games": DEFAULT_CATALOG_ENTRIES}, default_source="builtin")
 
@@ -96,11 +95,21 @@ class PatchCatalog:
             raw_version = data.get("version")
             if raw_version is not None:
                 version = int(raw_version)
-            raw_entries = data.get("games") or data.get("entries") or []
+            if "games" in data:
+                raw_entries = data["games"]
+            elif "entries" in data:
+                raw_entries = data["entries"]
+            else:
+                raw_entries = []
         elif isinstance(data, list):
             raw_entries = data
         else:
             raise ValueError("清单 JSON 格式无效，应为对象或条目列表")
+
+        if not isinstance(raw_entries, list) or not all(
+            isinstance(item, dict) for item in raw_entries
+        ):
+            raise ValueError('清单 JSON 格式无效，games/entries 应为条目对象列表')
 
         entries = [
             CatalogEntry.from_dict(item, default_source=default_source)
@@ -133,13 +142,21 @@ class PatchCatalog:
             return cls.from_url(source_str)
         return cls.from_file(source_str)
 
-    def save_to_file(self, path: Optional[Union[str, Path]] = None) -> Path:
-        """将当前清单保存为 JSON 文件。"""
+    def save_to_file(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        *,
+        include_passwords: bool = True,
+    ) -> Path:
+        """将当前清单保存为 JSON 文件；导出分享时可关闭明文解压密码。"""
         target = Path(path) if path is not None else self.default_storage_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": self.version,
-            "games": [entry.to_dict() for entry in self.entries],
+            "games": [
+                entry.to_dict(include_password=include_passwords)
+                for entry in self.entries
+            ],
         }
         target.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -222,25 +239,6 @@ class PatchCatalog:
             report[entry.id] = (ok, detail)
         return report
 
-    def search_online_for_entry(
-        self,
-        entry_or_query: Union[CatalogEntry, str, int],
-        *,
-        extra_page_urls: Optional[Sequence[str]] = None,
-        timeout: float = 12.0,
-    ) -> list[OnlinePatchCandidate]:
-        """自动在公开补丁库（VNDB / GitHub Releases / 指定网页）爬取对应游戏的补丁链接。"""
-        if isinstance(entry_or_query, CatalogEntry):
-            query = entry_or_query.install_dir_name or entry_or_query.name
-        else:
-            found = self.find_entry(entry_or_query)
-            query = (found.install_dir_name or found.name) if found else str(entry_or_query)
-        return discover_patches_online(
-            query,
-            extra_page_urls=extra_page_urls,
-            timeout=timeout,
-        )
-
     def find_entry(self, query: Union[str, int]) -> Optional[CatalogEntry]:
         """按 Steam AppID、条目 id、游戏名称或目录名查找清单条目。"""
         query_str = str(query).strip()
@@ -288,6 +286,11 @@ class PatchCatalog:
         results: list[InstalledGameStatus] = []
         seen_dirs: set[Path] = set()
 
+        # 深度扫描整个磁盘很慢，只做一次，所有条目共用结果（原先每个条目扫一遍）。
+        deep_candidates: Optional[list[Path]] = None
+        if deep_scan:
+            deep_candidates = list(deep_scan_games(roots=deep_scan_roots))
+
         for entry in self.entries:
             game_dir: Optional[Path] = None
             installed = False
@@ -297,8 +300,8 @@ class PatchCatalog:
                 game_dir = active_locator.locate(
                     entry.to_game_profile(),
                     include_manual=include_manual,
-                    deep_scan=deep_scan,
-                    deep_scan_roots=deep_scan_roots,
+                    deep_scan=False,
+                    deep_candidates=deep_candidates,
                 ).resolve()
                 installed = True
                 seen_dirs.add(game_dir)
@@ -351,8 +354,8 @@ class PatchCatalog:
                 )
 
         # 追加深度扫描发现的非 Steam 本地 Galgame
-        if deep_scan:
-            for candidate_dir in deep_scan_games(roots=deep_scan_roots):
+        if deep_candidates is not None:
+            for candidate_dir in deep_candidates:
                 resolved = candidate_dir.resolve()
                 if resolved in seen_dirs:
                     continue

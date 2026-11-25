@@ -520,8 +520,8 @@ class TestV030Improvements(unittest.TestCase):
         self.assertEqual((self.game_dir / "a.xp3").read_bytes(), b"ORIG_A")
         self.assertFalse((self.game_dir / "added.xp3").exists())
 
-    def test_p3_3_concurrency_lock_and_stale_pid_cleanup(self) -> None:
-        """P3-3: .lock 中为当前活动 PID 时抛 ConcurrencyError；为不存在的陈旧 PID 时自动清理并继续。"""
+    def test_p3_3_concurrency_lock_uses_os_lock(self) -> None:
+        """P3-3: 真实持有 OS 锁时抛 ConcurrencyError；残留锁文件不会阻塞后续安装。"""
         lock_dir = self.game_dir / GalgamePatcher.BACKUP_FOLDER_NAME
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_file = lock_dir / ".lock"
@@ -529,16 +529,38 @@ class TestV030Improvements(unittest.TestCase):
         patch_file = self.root / "a.xp3"
         patch_file.write_bytes(b"LOCK_TEST_A")
 
-        # 1) 写入当前进程 PID，第二次实例应抛 ConcurrencyError
-        lock_file.write_text(str(os.getpid()), encoding="utf-8")
-        with self.assertRaises(ConcurrencyError) as ctx:
-            self.patcher.apply(patch_file, game_dir=self.game_dir)
-        self.assertIn(str(os.getpid()), str(ctx.exception))
+        # 1) 模拟另一个进程持有真实文件锁，第二次安装应被拒绝
+        handle = open(lock_file, "a+b")
+        try:
+            if sys.platform == "win32":
+                import msvcrt
 
-        # 2) 写入一个不存在的陈旧 PID，应自动清理锁并完成补丁安装
-        lock_file.write_text("99999991", encoding="utf-8")
-        with mock.patch("galgame_patcher.patcher._is_pid_running", return_value=False):
-            res = self.patcher.apply(patch_file, game_dir=self.game_dir)
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(ConcurrencyError):
+                self.patcher.apply(patch_file, game_dir=self.game_dir)
+        finally:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
+
+        # 2) 只剩历史诊断内容、没有真实锁：安装应正常完成并清理锁文件
+        lock_file.write_text('{"pid": 99999991, "started_at": ""}\n', encoding="utf-8")
+        res = self.patcher.apply(patch_file, game_dir=self.game_dir)
         self.assertTrue(res.success)
         self.assertEqual((self.game_dir / "a.xp3").read_bytes(), b"LOCK_TEST_A")
         self.assertFalse(lock_file.exists())

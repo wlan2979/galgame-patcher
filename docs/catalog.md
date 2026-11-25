@@ -34,7 +34,7 @@ galpatch auto my_game --catalog ./my_catalog.json --game-dir ./MyGame --dry-run
 galpatch auto my_game --catalog ./my_catalog.json --game-dir ./MyGame
 ```
 
-`catalog verify` 检查链接能否响应 HEAD 请求。站点可能限制自动请求，状态异常时可在浏览器中核对发布页。`auto` 会比对补丁文件的 SHA256。`patch_version` 是补丁的版本说明，游戏构建版本需由使用者核对。安装器类补丁请依照发布者的安装说明。
+`catalog verify` 检查链接能否响应 HEAD 请求；不支持 HEAD 的站点会自动改用只取首字节的 GET 复检。站点可能限制自动请求，状态异常时可在浏览器中核对发布页。`auto` 会比对补丁文件的 SHA256。`patch_version` 是补丁的版本说明，游戏构建版本需由使用者核对。安装器类补丁请依照发布者的安装说明。
 
 可用 `galpatch catalog update <清单URL> --catalog ./my_catalog.json` 拉取受信任的远程清单，已有文件会保留 `.bak` 副本。省略 `--catalog` 时使用默认用户清单。Windows 默认为 `%APPDATA%\galgame-patcher\catalog.json`，未设置 `APPDATA` 时为 `~/.config/galgame-patcher/catalog.json`。
 

@@ -400,8 +400,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             if args.catalog_action == "verify":
                 report = catalog.verify_links()
-                if args.catalog:
+                if args.catalog and not is_url(args.catalog):
                     catalog.save_to_file(args.catalog)
+                elif not args.catalog:
+                    catalog.save_to_file()
+                else:
+                    print("提示：清单来自 URL，验证结果不会写回远程地址。", file=sys.stderr)
                 all_ok = True
                 for entry_id, (ok, detail) in report.items():
                     mark = "有效" if ok else "失效"

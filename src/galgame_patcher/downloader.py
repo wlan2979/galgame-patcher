@@ -8,6 +8,7 @@ import http.client
 import json
 import logging
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -24,6 +25,7 @@ from .models import (
     BARE_EXECUTABLE_SUFFIXES,
     COMMON_ARCHIVE_EXTENSIONS,
     OnlinePatchCandidate,
+    file_sha256,
     get_appdata_dir,
 )
 
@@ -535,14 +537,27 @@ def check_url_head(
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}"
 
-    try:
+    def _request(method: str, headers: Optional[dict[str, str]] = None) -> int:
         with open_url_request(
-            cleaned, method="HEAD", timeout=timeout, proxies=proxies
+            cleaned, method=method, headers=headers, timeout=timeout, proxies=proxies
         ) as response:
-            status = getattr(response, "status", 200) or 200
-            if 200 <= int(status) < 400:
-                return True, f"HTTP {status}"
-            return False, f"HTTP {status}"
+            return int(getattr(response, "status", 200) or 200)
+
+    try:
+        try:
+            status = _request("HEAD")
+        except urllib.error.HTTPError as exc:
+            # 不少 CDN / 下载站不支持 HEAD（405）或对 HEAD 返回 403，
+            # 用只取首字节的 GET 再确认一次，避免把可用链接误判为失效。
+            if exc.code not in (403, 405, 501):
+                return False, f"HTTP {exc.code}"
+            status = _request("GET", {"Range": "bytes=0-0"})
+        else:
+            if status in (403, 405, 501):
+                status = _request("GET", {"Range": "bytes=0-0"})
+        if 200 <= status < 400 or status == 416:
+            return True, f"HTTP {status}"
+        return False, f"HTTP {status}"
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}"
     except Exception as exc:
@@ -1337,15 +1352,25 @@ def discover_patches_online(
     return results
 
 
-def _compute_file_sha256(file_path: Path) -> str:
-    digest = hashlib.sha256()
-    with file_path.open("rb") as fh:
-        while True:
-            chunk = fh.read(_CHUNK_SIZE)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest().lower()
+_CACHE_MAX_AGE_SECONDS = 14 * 24 * 60 * 60
+
+
+def _cleanup_download_cache(cache_root: Path, *, keep: Path) -> None:
+    """删除默认下载缓存中超过 14 天的旧条目（外部 dest_dir 不受影响）。"""
+    try:
+        entries = list(cache_root.iterdir())
+    except OSError:
+        return
+    cutoff = time.time() - _CACHE_MAX_AGE_SECONDS
+    for entry in entries:
+        if entry == keep or not entry.is_dir() or entry.is_symlink():
+            continue
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
 
 
 def _infer_filename(url: str, content_disposition: Optional[str]) -> str:
@@ -1396,15 +1421,18 @@ def download_patch(
 
     if dest_dir is None:
         cache_key = hashlib.sha256(f"{url}\0{normalized_expected or ''}".encode()).hexdigest()
-        cache_dir = Path(tempfile.gettempdir()) / "galgame_patcher_cache" / cache_key
+        cache_root = Path(tempfile.gettempdir()) / "galgame_patcher_cache"
+        cache_dir = cache_root / cache_key
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _cleanup_download_cache(cache_root, keep=cache_dir)
     else:
         cache_dir = Path(dest_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
     if requested_name:
         initial_target = cache_dir / requested_name
         if initial_target.is_file() and normalized_expected:
-            if _compute_file_sha256(initial_target) == normalized_expected:
+            if file_sha256(initial_target) == normalized_expected:
                 size = initial_target.stat().st_size
                 if progress_callback:
                     progress_callback(size, size)
@@ -1422,7 +1450,7 @@ def download_patch(
             target_path = cache_dir / resolved_name
 
             if target_path.is_file() and normalized_expected:
-                if _compute_file_sha256(target_path) == normalized_expected:
+                if file_sha256(target_path) == normalized_expected:
                     size = target_path.stat().st_size
                     if progress_callback:
                         progress_callback(size, size)

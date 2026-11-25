@@ -573,8 +573,12 @@ class SteamLocator:
         include_manual: bool = True,
         deep_scan: Optional[bool] = None,
         deep_scan_roots: Optional[Sequence[PathLike]] = None,
+        deep_candidates: Optional[Sequence[Path]] = None,
     ) -> Path:
-        """按 ManualLocator -> SteamLocator -> 深度扫描候选 的顺序定位游戏目录（P2-1）。"""
+        """按 ManualLocator -> SteamLocator -> 深度扫描候选 的顺序定位游戏目录（P2-1）。
+
+        deep_candidates 允许调用方复用一次深度扫描的结果，避免批量定位时重复扫描磁盘。
+        """
         resolved_app_id = app_id if app_id is not None else (
             profile.steam_app_id if profile else None
         )
@@ -615,8 +619,14 @@ class SteamLocator:
             if deep_scan_roots is not None
             else self.deep_scan_roots
         )
-        if use_deep or roots_to_use is not None:
-            for candidate_dir in iter_deep_scan_candidates(roots=roots_to_use):
+        if deep_candidates is not None:
+            candidates: Sequence[Path] = deep_candidates
+        elif use_deep or roots_to_use is not None:
+            candidates = list(iter_deep_scan_candidates(roots=roots_to_use))
+        else:
+            candidates = ()
+        if candidates:
+            for candidate_dir in candidates:
                 if not self._is_valid_game_dir(candidate_dir, resolved_exe):
                     continue
                 for candidate_name in (resolved_install_dir, resolved_game_name):

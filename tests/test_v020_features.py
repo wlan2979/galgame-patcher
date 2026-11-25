@@ -423,6 +423,9 @@ class TestV020Features(unittest.TestCase):
         app.root = mock.Mock()
         app._poll_after_id = "after#queue"
         app._active_thread = None
+        app._closing = False
+        app._install_active = False
+        app._cancel_scan_flag = False
         app._save_gui_config = mock.Mock()
 
         app._on_close()

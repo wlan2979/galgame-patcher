@@ -33,6 +33,7 @@ from .models import (
     GameRunningError,
     InstalledGameStatus,
     OnlinePatchCandidate,
+    PatchFileInspection,
     get_appdata_dir,
 )
 from .patcher import GalgamePatcher, inspect_patch_file
@@ -106,6 +107,8 @@ class GalgamePatcherGUI:
         self._statuses: list[InstalledGameStatus] = []
         self._filtered_indices: list[int] = []
         self._busy = False
+        self._inspecting = False
+        self._install_active = False
         self._closing = False
         self._cancel_scan_flag = False
         self._search_after_id: Optional[str] = None
@@ -135,6 +138,8 @@ class GalgamePatcherGUI:
         self.status_var = tk.StringVar(
             value="就绪：支持扫描 Steam / 本地游戏、自动上网爬取补丁或按 Ctrl+V 粘贴补丁路径。"
         )
+        # 手动改游戏目录时清空上一条清单条目遗留的目标子目录，避免补丁写进错误的文件夹。
+        self.game_dir_var.trace_add("write", self._on_game_dir_var_changed)
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -167,14 +172,38 @@ class GalgamePatcherGUI:
         except Exception as exc:
             logger.debug("保存 GUI 配置失败: %s", exc)
 
+    def _on_game_dir_var_changed(self, *_args: object) -> None:
+        if self.target_subdir_var.get():
+            self.target_subdir_var.set("")
+
     def _on_close(self) -> None:
+        """关闭窗口；若正在写补丁则等待写完，避免留下半截文件。"""
+        if self._closing:
+            return
+        if self._install_active and not messagebox.askyesno(
+            "退出确认",
+            "补丁操作仍在进行。现在退出会中断写入并可能损坏游戏文件。\n"
+            "确定要退出吗？程序会等当前操作完成后再关闭。",
+        ):
+            return
+
         self._closing = True
         if self._poll_after_id is not None:
             self.root.after_cancel(self._poll_after_id)
             self._poll_after_id = None
         self._cancel_scan_flag = True
-        if self._active_thread is not None and self._active_thread.is_alive():
-            self._active_thread.join(timeout=1.0)
+
+        if self._install_active and self._active_thread is not None and self._active_thread.is_alive():
+            self._set_status("正在等待当前补丁操作结束，完成后自动关闭…", is_error=True)
+            self.root.after(200, self._close_when_idle)
+            return
+        self._save_gui_config()
+        self.root.destroy()
+
+    def _close_when_idle(self) -> None:
+        if self._install_active and self._active_thread is not None and self._active_thread.is_alive():
+            self.root.after(200, self._close_when_idle)
+            return
         self._save_gui_config()
         self.root.destroy()
 
@@ -361,6 +390,13 @@ class GalgamePatcherGUI:
             row=0, column=3, sticky=tk.EW
         )
 
+        ttk.Label(options_row, text="目标子目录 (可选，留空=根目录):").grid(
+            row=1, column=0, sticky=tk.W, padx=(0, 6), pady=(6, 0)
+        )
+        ttk.Entry(options_row, textvariable=self.target_subdir_var).grid(
+            row=1, column=1, columnspan=3, sticky=tk.EW, pady=(6, 0)
+        )
+
         backup_options = ttk.Frame(right_frame)
         backup_options.grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=4)
         ttk.Checkbutton(
@@ -427,25 +463,43 @@ class GalgamePatcherGUI:
         self.inspect_text.insert("1.0", text)
         self.inspect_text.configure(state=tk.DISABLED)
 
-    def _inspect_and_confirm_local_patch(
-        self, raw_path: str, *, ask_exec_confirm: bool = True
-    ) -> bool:
-        """检查本地补丁文件并在预览区展示详情；若是裸可执行文件则弹出二次确认。"""
+    def _inspect_patch_async(
+        self,
+        raw_path: str,
+        *,
+        ask_exec_confirm: bool,
+        on_ready: Callable[[bool], None],
+    ) -> None:
+        """在后台线程计算 SHA256，避免大补丁文件卡住界面；结果经队列回到 UI 线程。"""
         target = Path(raw_path)
         if target.is_dir():
             self._set_inspect_text(
                 f"目录: {target.resolve()}\n类型: 补丁文件夹（安装时将递归写入目录下所有文件）"
             )
             self._inspected_key = (str(target.resolve()), "DIR")
-            return True
+            on_ready(True)
+            return
 
-        try:
-            inspection = inspect_patch_file(target)
-        except Exception as exc:
-            self._set_inspect_text(f"无法读取本地文件信息: {exc}")
-            self._inspected_key = None
-            return False
+        self._inspecting = True
+        self._inspected_key = None
+        self._set_inspect_text(f"正在读取并计算 SHA256: {target}\n大文件可能需要几秒钟…")
 
+        def _worker() -> None:
+            try:
+                inspection = inspect_patch_file(target)
+            except Exception as exc:
+                self._ui_queue.put(("inspect_failed", str(exc), on_ready))
+            else:
+                self._ui_queue.put(
+                    ("inspect_done", inspection, ask_exec_confirm, on_ready)
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_inspection(
+        self, inspection: PatchFileInspection, *, ask_exec_confirm: bool
+    ) -> bool:
+        """展示核验详情；裸可执行文件在继续前需要用户二次确认。"""
         self._set_inspect_text(inspection.describe())
         key = (str(inspection.path), inspection.sha256)
         self._inspected_key = key
@@ -523,6 +577,33 @@ class GalgamePatcherGUI:
     def _handle_queue_event(self, kind: str, event: tuple[Any, ...]) -> None:
         if kind in ("scan_done", "search_done", "success", "warning", "error"):
             self._set_busy(False)
+
+        if kind == "inspect_done":
+            self._inspecting = False
+            inspection, ask_confirm, on_ready = event[1], event[2], event[3]
+            try:
+                ready = self._finish_inspection(
+                    inspection, ask_exec_confirm=ask_confirm
+                )
+            except Exception:
+                logger.exception("处理补丁文件核验结果失败")
+                self._set_status("处理补丁文件核验结果失败，详情见日志。", is_error=True)
+                on_ready(False)
+                return
+            if not ready:
+                self._set_status("已取消导入未确认的可执行文件。", is_error=True)
+            on_ready(ready)
+            return
+        if kind == "inspect_failed":
+            self._inspecting = False
+            self._inspected_key = None
+            detail = str(event[1])
+            self._set_inspect_text(f"无法读取本地文件信息: {detail}")
+            self._set_status(
+                f"无法读取补丁文件: {detail.splitlines()[0]}", is_error=True
+            )
+            event[2](False)
+            return
 
         if kind == "progress":
             pct, msg = event[1], event[2]
@@ -613,8 +694,14 @@ class GalgamePatcherGUI:
         self.patch_source_var.set(raw)
         self.sha256_var.set("")
         if Path(raw).exists():
-            self._inspect_and_confirm_local_patch(raw, ask_exec_confirm=True)
-        self._set_status(f"已从剪贴板填入补丁路径: {raw}", is_error=False)
+            def _on_inspected(confirmed: bool) -> None:
+                if not confirmed:
+                    self.patch_source_var.set("")
+
+            self._inspect_patch_async(raw, ask_exec_confirm=True, on_ready=_on_inspected)
+            self._set_status(f"已从剪贴板填入补丁路径，正在校验: {raw}", is_error=False)
+        else:
+            self._set_status(f"已从剪贴板填入补丁路径（文件不存在）: {raw}", is_error=True)
 
     def scan_games_async(self) -> None:
         """在后台线程扫描 Steam 库、手工登记库及可选的深度扫描目录（P3-1 #4）。"""
@@ -807,9 +894,12 @@ class GalgamePatcherGUI:
         if not path:
             return
         try:
-            self.catalog.save_to_file(path)
-            self._append_log(f"已导出清单到: {path}")
-            messagebox.showinfo("导出成功", f"已导出清单到:\n{path}")
+            self.catalog.save_to_file(path, include_passwords=False)
+            self._append_log(f"已导出清单到（不含明文解压密码）: {path}")
+            messagebox.showinfo(
+                "导出成功",
+                f"已导出清单到:\n{path}\n\n出于安全考虑，导出文件不包含明文解压密码。",
+            )
         except Exception as exc:
             logger.exception("导出清单失败")
             self._set_status(f"导出失败: {exc}", is_error=True)
@@ -843,19 +933,23 @@ class GalgamePatcherGUI:
         )
         if path:
             self._confirmed_exec_key = None
-            confirmed = self._inspect_and_confirm_local_patch(
-                path, ask_exec_confirm=True
-            )
-            if not confirmed:
-                self.patch_source_var.set("")
-                self._inspected_key = None
-                self._set_status("已取消导入未确认的可执行文件。", is_error=True)
-                return
-            self.patch_source_var.set(path)
-            self.sha256_var.set("")
-            self._gui_config["last_patch_dir"] = str(Path(path).parent)
-            self._save_gui_config()
-            self._set_status(f"已检查本地补丁文件并显示 SHA256: {Path(path).name}", is_error=False)
+            self._set_status(f"正在校验 {Path(path).name}…", is_error=False)
+
+            def _on_inspected(confirmed: bool) -> None:
+                if not confirmed:
+                    self.patch_source_var.set("")
+                    self._inspected_key = None
+                    return
+                self.patch_source_var.set(path)
+                self.sha256_var.set("")
+                self._gui_config["last_patch_dir"] = str(Path(path).parent)
+                self._save_gui_config()
+                self._set_status(
+                    f"已检查本地补丁文件并显示 SHA256: {Path(path).name}",
+                    is_error=False,
+                )
+
+            self._inspect_patch_async(path, ask_exec_confirm=True, on_ready=_on_inspected)
 
     def open_game_dir(self) -> None:
         game_dir = self.game_dir_var.get().strip()
@@ -1148,7 +1242,7 @@ class GalgamePatcherGUI:
         ttk.Button(btn_bar, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT)
 
     def _run_patch_task(self, *, dry_run: bool) -> None:
-        if self._busy:
+        if self._busy or self._inspecting:
             return
         game_dir = self.game_dir_var.get().strip()
         patch_source = self.patch_source_var.get().strip()
@@ -1171,31 +1265,64 @@ class GalgamePatcherGUI:
             )
             return
 
-        # 确认本地文件已检查预览且（如为可执行文件）经过二次确认
-        if not self._inspect_and_confirm_local_patch(
-            patch_source, ask_exec_confirm=not dry_run
-        ):
-            return
-
         password = self.password_var.get().strip() or None
         expected_sha256 = self.sha256_var.get().strip() or None
         target_subdir = self.target_subdir_var.get().strip()
         backup = self.backup_var.get()
 
-        # 危险操作二次确认（P3-1 #6）
-        if not dry_run:
-            backup_note = (
-                "已备份至 .galpatch_backup" if backup else "注意：已取消勾选自动备份"
-            )
-            hash_note = "" if expected_sha256 else "\n未填写发布者的 SHA256，请确认文件来自可信来源。"
-            if not messagebox.askyesno(
-                "确认安装补丁",
-                f"即将把补丁安装到游戏目录:\n{game_dir}\n\n"
-                f"将覆盖同名文件（{backup_note}）。{hash_note}\n确定继续吗？",
-            ):
+        def _after_inspection(confirmed: bool) -> None:
+            if not confirmed:
                 return
+            # 危险操作二次确认（P3-1 #6）
+            if not dry_run:
+                backup_note = (
+                    "已备份至 .galpatch_backup" if backup else "注意：已取消勾选自动备份"
+                )
+                hash_note = (
+                    ""
+                    if expected_sha256
+                    else "\n未填写发布者的 SHA256，请确认文件来自可信来源。"
+                )
+                if not messagebox.askyesno(
+                    "确认安装补丁",
+                    f"即将把补丁安装到游戏目录:\n{game_dir}\n\n"
+                    f"将覆盖同名文件（{backup_note}）。{hash_note}\n确定继续吗？",
+                ):
+                    return
+            self._start_patch_task(
+                dry_run=dry_run,
+                game_dir=game_dir,
+                patch_source=patch_source,
+                password=password,
+                expected_sha256=expected_sha256,
+                target_subdir=target_subdir,
+                backup=backup,
+            )
 
+        # SHA256 在后台线程计算，避免大文件冻结界面；完成后再弹确认框。
+        self._set_status("正在校验补丁文件并计算 SHA256…", is_error=False)
+        self._inspect_patch_async(
+            patch_source,
+            ask_exec_confirm=not dry_run,
+            on_ready=_after_inspection,
+        )
+
+    def _start_patch_task(
+        self,
+        *,
+        dry_run: bool,
+        game_dir: str,
+        patch_source: str,
+        password: Optional[str],
+        expected_sha256: Optional[str],
+        target_subdir: str,
+        backup: bool,
+    ) -> None:
+        if self._busy:
+            self._set_status("已有操作正在进行，请稍后再试。", is_error=True)
+            return
         self._set_busy(True)
+        self._install_active = True
         self.progress.configure(value=0)
         start_msg = "正在预览补丁变更..." if dry_run else "正在安装补丁，请稍候..."
         self._set_status(start_msg, is_error=False)
@@ -1239,6 +1366,8 @@ class GalgamePatcherGUI:
             except Exception as exc:
                 logger.exception("补丁操作异常")
                 self._ui_queue.put(("error", str(exc)))
+            finally:
+                self._install_active = False
 
         t = threading.Thread(target=_worker, daemon=True)
         self._active_thread = t
@@ -1266,6 +1395,7 @@ class GalgamePatcherGUI:
             return
 
         self._set_busy(True)
+        self._install_active = True
         self.progress.configure(value=10)
         self._set_status("正在还原备份文件，请稍候...", is_error=False)
 
@@ -1285,6 +1415,8 @@ class GalgamePatcherGUI:
             except Exception as exc:
                 logger.exception("回滚异常")
                 self._ui_queue.put(("error", str(exc)))
+            finally:
+                self._install_active = False
 
         t = threading.Thread(target=_worker, daemon=True)
         self._active_thread = t
