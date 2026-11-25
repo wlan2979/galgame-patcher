@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import ctypes
-import hashlib
+import errno
 import json
 import logging
 import os
@@ -15,7 +14,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence, Union
+from typing import Any, BinaryIO, Iterator, Optional, Sequence, Union
 
 from .archive import extract_archive, is_supported_archive
 from .catalog import PatchCatalog
@@ -30,32 +29,15 @@ from .models import (
     PatchFileInspection,
     PatchResult,
     UntrustedSourceError,
+    file_sha256,
 )
 
 logger = logging.getLogger("galgame_patcher")
 
-_CHUNK_SIZE = 1024 * 1024
-
-
-def _raw_sha256(file_path: Union[str, Path]) -> str:
-    """内部使用的真实文件 SHA256 计算函数。"""
-    path = Path(file_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"无法计算 SHA256，文件不存在: {path}")
-
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        while True:
-            chunk = fh.read(_CHUNK_SIZE)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest().lower()
-
 
 def compute_sha256(file_path: Union[str, Path]) -> str:
     """分块计算指定文件的 SHA256 十六进制摘要（小写）。"""
-    return _raw_sha256(file_path)
+    return file_sha256(file_path)
 
 
 def inspect_patch_file(path: Union[str, Path]) -> PatchFileInspection:
@@ -107,39 +89,6 @@ def _is_file_locked(path: Path) -> bool:
         return False
 
 
-def _is_pid_running(pid: int) -> bool:
-    """检测给定 PID 的进程是否仍在运行（P3-3）。"""
-    if pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
-
-    if sys.platform == "win32":
-        process_query_limited_info = 0x1000
-        still_active = 259
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(process_query_limited_info, False, int(pid))
-        if not handle:
-            return False
-        try:
-            exit_code = ctypes.c_ulong()
-            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return exit_code.value == still_active
-            return False
-        finally:
-            kernel32.CloseHandle(handle)
-
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
 def _parse_lock_content(raw_text: str) -> tuple[Optional[int], str]:
     """解析 .lock 文件中的 PID 与启动时间（兼容 JSON 与纯数字格式）。"""
     text = raw_text.strip()
@@ -183,57 +132,138 @@ class GalgamePatcher:
         """初始化补丁安装器，可注入自定义 SteamLocator 实例。"""
         self.locator = locator or SteamLocator()
 
+    @staticmethod
+    def _acquire_os_lock(handle: BinaryIO) -> None:
+        """对已打开的锁文件加非阻塞排他锁；锁由操作系统持有，进程退出时自动释放。"""
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _release_os_lock(handle: BinaryIO) -> None:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            # 关闭句柄时操作系统也会释放锁，这里失败无需处理。
+            pass
+
+    @staticmethod
+    def _read_lock_owner(lock_path: Path) -> tuple[Optional[int], str]:
+        """读取锁文件最后一行写入的持有者信息（仅用于错误提示）。"""
+        try:
+            raw = lock_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None, ""
+        lines = [line for line in raw.splitlines() if line.strip()]
+        if not lines:
+            return None, ""
+        return _parse_lock_content(lines[-1])
+
+    @staticmethod
+    def _lock_file_is_current(handle: BinaryIO, lock_path: Path) -> bool:
+        """确认加锁的仍是路径上的那个文件，避免锁到已被删除的旧文件。"""
+        try:
+            path_stat = os.stat(lock_path)
+            file_stat = os.fstat(handle.fileno())
+        except OSError:
+            return False
+        return (path_stat.st_dev, path_stat.st_ino) == (
+            file_stat.st_dev,
+            file_stat.st_ino,
+        )
+
     @contextmanager
     def _directory_lock(self, game_dir: Path) -> Iterator[Path]:
-        """在 game_dir/.galpatch_backup/.lock 上创建排他锁，自动清理陈旧锁（P3-3）。"""
+        """用操作系统文件锁互斥同一游戏目录的安装/回滚（P3-3）。
+
+        锁文件只是诊断信息的载体：互斥由 OS 锁保证，进程崩溃退出时内核自动释放，
+        因此不再需要「判断 PID 是否存活再删锁」这种存在竞态的做法。
+        """
         backup_root = game_dir / self.BACKUP_FOLDER_NAME
         backup_root.mkdir(parents=True, exist_ok=True)
         lock_path = backup_root / ".lock"
 
-        acquired_fd: Optional[int] = None
-        for _ in range(2):
+        handle: Optional[BinaryIO] = None
+        locked = False
+        for _ in range(5):
+            candidate = open(lock_path, "a+b")
             try:
-                acquired_fd = os.open(
-                    str(lock_path),
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                self._acquire_os_lock(candidate)
+            except OSError as exc:
+                candidate.close()
+                unsupported = (
+                    sys.platform != "win32"
+                    and exc.errno in (errno.ENOLCK, errno.ENOTSUP)
                 )
+                if unsupported:
+                    logger.warning("文件系统不支持文件锁，已跳过并发互斥: %s", exc)
+                    break
+                pid, started_at = self._read_lock_owner(lock_path)
+                raise ConcurrencyError(pid=pid, started_at=started_at) from exc
+            if self._lock_file_is_current(candidate, lock_path):
+                handle = candidate
+                locked = True
                 break
-            except FileExistsError:
-                try:
-                    raw = lock_path.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    raw = ""
-                pid, started_at = _parse_lock_content(raw)
-                if pid is not None and _is_pid_running(pid):
-                    raise ConcurrencyError(pid=pid, started_at=started_at)
-                logger.info("清理已退出的陈旧进程锁 (PID=%s): %s", pid, lock_path)
-                try:
-                    lock_path.unlink()
-                except OSError:
-                    raise ConcurrencyError(pid=pid, started_at=started_at)
-
-        if acquired_fd is None:
+            # 上一个持有者刚删除了锁文件，拿到的是旧文件：释放后重试。
+            self._release_os_lock(candidate)
+            candidate.close()
+        else:
             raise ConcurrencyError(pid=None)
 
         try:
-            payload = json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "started_at": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False,
-            )
-            os.write(acquired_fd, payload.encode("utf-8"))
-        finally:
-            os.close(acquired_fd)
+            if locked and handle is not None:
+                try:
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(
+                        json.dumps(
+                            {
+                                "pid": os.getpid(),
+                                "started_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
+                    handle.flush()
+                except OSError:
+                    logger.debug("写入锁诊断信息失败", exc_info=True)
 
-        try:
             yield lock_path
         finally:
-            try:
-                lock_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if handle is not None:
+                try:
+                    if locked and sys.platform != "win32":
+                        # POSIX 允许在持有锁时删除文件；先删后放锁，
+                        # 新持有者会通过 inode 校验发现文件已被替换并重试。
+                        try:
+                            lock_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    if locked:
+                        self._release_os_lock(handle)
+                finally:
+                    handle.close()
+                    if locked and sys.platform == "win32":
+                        # Windows 上其他进程打开着锁文件时删除会失败，锁文件保留，
+                        # 下个进程在同一文件上重新加锁，仍然互斥。
+                        try:
+                            lock_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
             try:
                 if backup_root.is_dir() and not any(backup_root.iterdir()):
                     backup_root.rmdir()
@@ -289,7 +319,7 @@ class GalgamePatcher:
         if expected_sha256 is not None:
             if not source_path.is_file():
                 raise ValueError("仅支持对单个补丁文件或压缩包进行 SHA256 校验")
-            actual_hash = _raw_sha256(source_path)
+            actual_hash = file_sha256(source_path)
             expected_normalized = expected_sha256.strip().lower()
             if actual_hash != expected_normalized:
                 raise ValueError(
@@ -305,8 +335,7 @@ class GalgamePatcher:
 
         resolved_subdir = target_subdir or (profile.target_subdir if profile else "")
         dest_root = self._resolve_dest_root(resolved_game_dir, resolved_subdir)
-        if not dry_run:
-            dest_root.mkdir(parents=True, exist_ok=True)
+        # 目标子目录由 _install_files 在写文件时按需创建并登记，回滚时只删除这些新建目录。
 
         with tempfile.TemporaryDirectory(prefix="galpatch_") as temp_dir_str:
             temp_dir = Path(temp_dir_str)
@@ -445,7 +474,6 @@ class GalgamePatcher:
                         continue
                     target_file.unlink()
                     removed_new.append(rel_posix)
-                    self._cleanup_empty_parents(target_file.parent, resolved_game_dir)
                 except (OSError, ValueError) as exc:
                     failed_files.append(rel_posix)
                     failed_reasons[rel_posix] = f"{type(exc).__name__}: {exc}"
@@ -471,6 +499,10 @@ class GalgamePatcher:
                     failed_reasons=failed_reasons,
                     verified=False,
                 )
+
+            raw_created = manifest.get("created_dirs")
+            if isinstance(raw_created, list):
+                self._remove_created_empty_dirs(resolved_game_dir, raw_created)
 
             try:
                 for snapshot in backup_root.glob("install-*"):
@@ -599,7 +631,6 @@ class GalgamePatcher:
             try:
                 if snapshot is None:
                     target.unlink(missing_ok=True)
-                    self._cleanup_empty_parents(target.parent, game_dir)
                 else:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(snapshot, target)
@@ -614,6 +645,10 @@ class GalgamePatcher:
                 message="撤回最近一次安装时部分文件处理失败，已保留记录，可重试。",
                 failed_files=list(failures), failed_reasons=failures,
             )
+
+        raw_created = journal.get("created_dirs")
+        if isinstance(raw_created, list):
+            self._remove_created_empty_dirs(game_dir, raw_created)
 
         manifest_path = backup_root / "manifest.json"
         if previous is None:
@@ -770,6 +805,7 @@ class GalgamePatcher:
 
             existing_backed_up: set[str] = set()
             existing_newly_added: set[str] = set()
+            existing_created_dirs: set[str] = set()
             previous_manifest = None
             if manifest_path.is_file():
                 old_manifest = self._read_backup_manifest(manifest_path)
@@ -779,9 +815,15 @@ class GalgamePatcher:
                     previous_manifest = old_manifest
                     existing_backed_up.update(old_manifest.get("backed_up_files", []))
                     existing_newly_added.update(old_manifest.get("newly_added_files", []))
+                    raw_created = old_manifest.get("created_dirs")
+                    if isinstance(raw_created, list):
+                        existing_created_dirs.update(
+                            item for item in raw_created if isinstance(item, str)
+                        )
 
             installed_files: list[str] = []
             backed_up_this_run: list[str] = []
+            created_dirs_this_run: set[str] = set()
             prior_contents: dict[str, Optional[Path]] = {}
             snapshot_dir: Optional[Path] = None
 
@@ -791,6 +833,7 @@ class GalgamePatcher:
                     "status": status,
                     "backed_up_files": sorted(existing_backed_up),
                     "newly_added_files": sorted(existing_newly_added),
+                    "created_dirs": sorted(existing_created_dirs),
                 }
                 if latest_install is not None:
                     payload["latest_install"] = latest_install
@@ -805,7 +848,6 @@ class GalgamePatcher:
                     try:
                         if snapshot is None:
                             target_file.unlink(missing_ok=True)
-                            self._cleanup_empty_parents(target_file.parent, game_dir)
                         else:
                             target_file.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(snapshot, target_file)
@@ -815,10 +857,13 @@ class GalgamePatcher:
                 if failures:
                     return f"自动回滚未完成，备份已保留：{', '.join(failures)}"
 
+                self._remove_created_empty_dirs(game_dir, sorted(created_dirs_this_run))
+
                 try:
                     if previous_manifest is None:
                         existing_backed_up.clear()
                         existing_newly_added.clear()
+                        existing_created_dirs.clear()
                         _sync_manifest("rolled_back")
                     else:
                         _write_manifest_atomic(manifest_path, previous_manifest)
@@ -832,7 +877,7 @@ class GalgamePatcher:
             try:
                 for src_file, dst_file in file_pairs:
                     rel_posix = dst_file.resolve().relative_to(game_dir).as_posix()
-                    expected_file_hash = _raw_sha256(src_file)
+                    expected_file_hash = file_sha256(src_file)
 
                     if dst_file.exists():
                         if rel_posix in existing_backed_up or rel_posix in existing_newly_added:
@@ -856,10 +901,12 @@ class GalgamePatcher:
 
                     _sync_manifest("in_progress")
                     prior_contents[rel_posix] = snapshot
+                    new_dirs = self._missing_created_dirs(rel_posix, game_dir)
+                    existing_created_dirs.update(new_dirs)
+                    created_dirs_this_run.update(new_dirs)
                     dst_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src_file, dst_file)
                     installed_files.append(rel_posix)
-                    _sync_manifest("in_progress")
 
                     # 安装后 SHA256 校验（P3-2）
                     written_hash = compute_sha256(dst_file)
@@ -893,6 +940,7 @@ class GalgamePatcher:
                                 name: snapshot.relative_to(backup_root).as_posix() if snapshot else None
                                 for name, snapshot in prior_contents.items()
                             },
+                            "created_dirs": sorted(created_dirs_this_run),
                         },
                     )
                     _sync_manifest("committed", snapshot_dir.name)
@@ -942,6 +990,34 @@ class GalgamePatcher:
                 ),
                 verified=True,
             )
+
+    @staticmethod
+    def _missing_created_dirs(rel_posix: str, game_dir: Path) -> list[str]:
+        """返回安装该文件时将新建的目录（相对 game_dir 的 POSIX 路径）。"""
+        current = (game_dir / Path(rel_posix)).parent
+        created: list[str] = []
+        while current != game_dir and not current.exists():
+            created.append(current.relative_to(game_dir).as_posix())
+            current = current.parent
+        return created
+
+    def _remove_created_empty_dirs(
+        self, game_dir: Path, relative_dirs: Sequence[str]
+    ) -> None:
+        """只删除本工具安装时新建、且当前仍为空的目录，最深层优先。"""
+        targets: list[Path] = []
+        for rel_posix in relative_dirs:
+            if not isinstance(rel_posix, str):
+                continue
+            try:
+                targets.append(self._restore_game_path(game_dir, Path(rel_posix)))
+            except ValueError:
+                continue
+        for target in sorted(targets, key=lambda item: len(item.parts), reverse=True):
+            try:
+                target.rmdir()
+            except OSError:
+                pass
 
     @staticmethod
     def _cleanup_empty_parents(directory: Path, stop_at: Path) -> None:

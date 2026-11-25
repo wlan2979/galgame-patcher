@@ -330,7 +330,11 @@ def _try_extract_with_7z(
     password_list: list[Optional[str]],
     timeout: float = 300.0,
 ) -> tuple[bool, str]:
-    """调用外部 7z CLI 解压（P1-3：无密码时省略 -p，返回码 0/1 视为成功，收集 stderr 摘要）。"""
+    """调用外部 7z CLI 解压（无密码时省略 -p，收集 stderr 摘要）。
+
+    只有返回码 0 才代表完整成功；7z 的返回码 1 表示「有文件未完整解压」，
+    此时游戏目录可能只写入了一部分补丁，必须按失败处理。
+    """
     last_detail = ""
     for pwd in password_list:
         _clear_directory(extract_dir)
@@ -343,8 +347,8 @@ def _try_extract_with_7z(
             cmd.append(f"-p{pwd}")
         cmd.extend([f"-o{extract_dir}", str(archive_path)])
         proc = _run_external(cmd, timeout=timeout)
-        if proc.returncode in (0, 1):
-            logger.debug("7z CLI 解压成功 (returncode=%d)", proc.returncode)
+        if proc.returncode == 0:
+            logger.debug("7z CLI 解压成功")
             return True, ""
         last_detail = _summarize_process_output(proc)
         logger.debug("7z CLI 解压尝试失败: %s", last_detail)
@@ -417,6 +421,21 @@ def _precheck_archive_members_with_bsdtar(
                 resolve_safe_member_path(extract_dir, entry)
 
 
+def _reject_library_archive_symlinks(archive_obj: object) -> None:
+    """解压前拒绝压缩包内的符号链接条目，避免解压库顺着链接写穿到外部目录。"""
+    list_members = getattr(archive_obj, "list", None)
+    if not callable(list_members):
+        return
+    try:
+        members = list_members() or ()
+    except Exception:
+        return
+    for info in members:
+        if getattr(info, "is_symlink", False):
+            filename = getattr(info, "filename", "<未知>")
+            raise ValueError(f"压缩包包含不安全的符号链接: {filename!r}")
+
+
 def _extract_7z(
     archive_path: Path,
     extract_dir: Path,
@@ -425,7 +444,8 @@ def _extract_7z(
     password_errors: list[Exception] = []
     cli_errors: list[str] = []
 
-    # 1. 优先尝试 py7zr（P1-1 异常分流 + P1-2 逐成员安全落盘）
+    # 1. 优先尝试 py7zr：先校验全部成员路径，再一次性解压到暂存目录后移入目标，
+    #    避免对 solid 压缩包逐成员解压导致重复解码（O(n²)）。
     try:
         import py7zr  # type: ignore[import-not-found]
 
@@ -438,18 +458,20 @@ def _extract_7z(
                     member_names = list(sz.getnames())
                     for name in member_names:
                         resolve_safe_member_path(extract_dir, name)
+                    _reject_library_archive_symlinks(sz)
 
                     with tempfile.TemporaryDirectory(prefix="py7zr_stage_") as stage_str:
                         stage_dir = Path(stage_str)
-                        for name in member_names:
-                            target = resolve_safe_member_path(extract_dir, name)
-                            sz.extract(path=stage_dir, targets=[name])
-                            staged_item = stage_dir / Path(*PurePosixPath(name.replace("\\", "/").lstrip("/")).parts)
-                            if staged_item.is_file():
+                        sz.extractall(path=stage_dir)
+                        _verify_extracted_tree(stage_dir)
+                        for staged_item in sorted(stage_dir.rglob("*")):
+                            rel = staged_item.relative_to(stage_dir)
+                            target = resolve_safe_member_path(extract_dir, rel.as_posix())
+                            if staged_item.is_dir():
+                                target.mkdir(parents=True, exist_ok=True)
+                            elif staged_item.is_file():
                                 target.parent.mkdir(parents=True, exist_ok=True)
                                 shutil.move(str(staged_item), str(target))
-                            if hasattr(sz, "reset"):
-                                sz.reset()
                 logger.debug("py7zr 解压成功")
                 return
             except ValueError:
