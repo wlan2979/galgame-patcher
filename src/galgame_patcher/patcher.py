@@ -340,7 +340,7 @@ class GalgamePatcher:
 
         with tempfile.TemporaryDirectory(prefix="galpatch_") as temp_dir_str:
             temp_dir = Path(temp_dir_str)
-            file_pairs = self._collect_patch_files(
+            file_pairs, skipped_files = self._collect_patch_files(
                 source_path=source_path,
                 dest_root=dest_root,
                 temp_dir=temp_dir,
@@ -355,6 +355,7 @@ class GalgamePatcher:
                 backup=backup,
                 force_locked=force_locked,
                 dry_run=dry_run,
+                skipped_files=skipped_files,
             )
 
     def apply_from_catalog(
@@ -630,7 +631,11 @@ class GalgamePatcher:
         elif raw_state == "rolled_back":
             status.state = "rolled_back"
         elif raw_state == "committed":
-            status.state = "installed"
+            status.state = (
+                "installed"
+                if manifest.get("latest_install") is not None
+                else "installed_no_history"
+            )
         else:
             status.state = "invalid"
             status.message = f"备份清单包含未知状态: {raw_state!r}"
@@ -803,8 +808,8 @@ class GalgamePatcher:
         strip_single_top_dir: bool,
         password: Optional[str],
         password_candidates: Optional[Sequence[str]],
-    ) -> list[tuple[Path, Path]]:
-        """将各种补丁源解析为 (源文件, 目标路径) 映射列表。"""
+    ) -> tuple[list[tuple[Path, Path]], list[str]]:
+        """将各种补丁源解析为 (源文件, 目标路径) 映射列表及被跳过的保留目录路径。"""
         if source_path.is_dir():
             return self._walk_source_dir(source_path, dest_root)
 
@@ -824,20 +829,27 @@ class GalgamePatcher:
                         effective_root = top_dir
             return self._walk_source_dir(effective_root, dest_root)
 
-        return [(source_path, dest_root / source_path.name)]
+        return [(source_path, dest_root / source_path.name)], []
 
     def _walk_source_dir(
         self, source_dir: Path, dest_root: Path
-    ) -> list[tuple[Path, Path]]:
+    ) -> tuple[list[tuple[Path, Path]], list[str]]:
         pairs: list[tuple[Path, Path]] = []
+        skipped: list[str] = []
         for item in sorted(source_dir.rglob("*")):
             if not item.is_file():
                 continue
             rel = item.relative_to(source_dir)
             if self.BACKUP_FOLDER_NAME in rel.parts:
+                skipped.append(rel.as_posix())
+                logger.warning(
+                    "补丁中的路径位于保留目录 %s，已跳过: %s",
+                    self.BACKUP_FOLDER_NAME,
+                    rel.as_posix(),
+                )
                 continue
             pairs.append((item, dest_root / rel))
-        return pairs
+        return pairs, skipped
 
     def _install_files(
         self,
@@ -847,8 +859,16 @@ class GalgamePatcher:
         backup: bool = True,
         force_locked: bool = False,
         dry_run: bool = False,
+        skipped_files: Optional[Sequence[str]] = None,
     ) -> PatchResult:
         """事务化安装补丁文件，支持前置占用检测、并发锁、写后校验与异常自动回滚。"""
+        skipped = list(skipped_files or ())
+        skipped_note = (
+            f"另有 {len(skipped)} 个文件位于保留目录 "
+            f"{self.BACKUP_FOLDER_NAME}，已跳过。"
+            if skipped
+            else ""
+        )
         # 1. Dry-run 仅预览模式（不写盘，P3-2）
         if dry_run:
             will_overwrite: list[str] = []
@@ -866,12 +886,14 @@ class GalgamePatcher:
                 f"（{', '.join(will_overwrite) if will_overwrite else '无'}），"
                 f"将新增 {len(will_add)} 个文件"
                 f"（{', '.join(will_add) if will_add else '无'}）。"
+                f"{skipped_note}"
             )
             return PatchResult(
                 success=True,
                 game_dir=game_dir,
                 installed_files=will_overwrite + will_add,
                 backed_up_files=will_overwrite,
+                skipped_files=skipped,
                 backup_dir=None,
                 message=preview_msg,
                 verified=False,
@@ -1015,7 +1037,11 @@ class GalgamePatcher:
                             installed_files=[],
                             backed_up_files=[],
                             backup_dir=backup_root,
-                            message=f"安装后文件校验失败 ({rel_posix})，{rollback_note}。",
+                            message=(
+                                f"安装后文件校验失败 ({rel_posix})，{rollback_note}。"
+                                f"{skipped_note}"
+                            ),
+                            skipped_files=skipped,
                             failed_files=[rel_posix],
                             failed_reasons={rel_posix: reason},
                             verified=False,
@@ -1077,9 +1103,10 @@ class GalgamePatcher:
                 installed_files=installed_files,
                 backed_up_files=backed_up_this_run,
                 backup_dir=used_backup_dir,
+                skipped_files=skipped,
                 message=(
                     f"补丁安装成功：写入并校验 {len(installed_files)} 个文件，"
-                    f"备份 {len(backed_up_this_run)} 个已有文件。"
+                    f"备份 {len(backed_up_this_run)} 个已有文件。{skipped_note}"
                 ),
                 verified=True,
             )

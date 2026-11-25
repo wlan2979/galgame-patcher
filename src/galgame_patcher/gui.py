@@ -1441,6 +1441,19 @@ class GalgamePatcherGUI:
             return
 
         mode = "keep-patches" if self.undo_latest_var.get() else "full"
+        if mode == "keep-patches":
+            try:
+                history = self.patcher.rollback_history(game_dir)
+            except Exception as exc:
+                messagebox.showerror("无法读取安装记录", str(exc))
+                return
+            if not history:
+                messagebox.showwarning(
+                    "无法逐次撤回",
+                    "当前游戏目录没有可逐次撤回的安装记录。\n"
+                    "请取消勾选「回滚时仅撤回最近一次安装」，改用完整回滚。",
+                )
+                return
         action = "撤回最近一次补丁安装" if mode == "keep-patches" else "完整还原备份"
         if not messagebox.askyesno("确认回滚", f"确定要对以下游戏{action}吗？\n{game_dir}"):
             return

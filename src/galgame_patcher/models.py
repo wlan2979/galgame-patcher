@@ -169,6 +169,7 @@ class PatchResult:
     game_dir: Path
     installed_files: list[str] = field(default_factory=list)
     backed_up_files: list[str] = field(default_factory=list)
+    skipped_files: list[str] = field(default_factory=list)
     backup_dir: Optional[Path] = None
     message: str = ""
     failed_files: list[str] = field(default_factory=list)
@@ -279,6 +280,7 @@ class InstalledGameStatus:
 INSTALL_STATE_LABELS: dict[str, str] = {
     "not_installed": "未安装补丁",
     "installed": "已安装补丁",
+    "installed_no_history": "已安装补丁（不支持逐次撤回）",
     "incomplete": "上次安装未完成",
     "rolled_back": "已回滚",
     "invalid": "备份清单损坏",

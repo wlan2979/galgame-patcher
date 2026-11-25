@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -10,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-from .downloader import check_url_head, fetch_json
+from .downloader import check_url_head, fetch_bytes
 from .locator import ManualLocator, SteamLocator, deep_scan_games
 from .models import (
     CatalogEntry,
@@ -66,6 +67,8 @@ class PatchCatalog:
     ) -> None:
         self.entries: list[CatalogEntry] = list(entries or ())
         self.version: int = int(version)
+        # 从远程加载时记录清单文件的 SHA256，便于用户核对与锁定来源。
+        self.remote_sha256: str = ""
 
     @staticmethod
     def default_storage_path() -> Path:
@@ -128,10 +131,31 @@ class PatchCatalog:
         return cls.from_dict(data, default_source=str(file_path))
 
     @classmethod
-    def from_url(cls, url: str, timeout: float = 15.0) -> PatchCatalog:
-        """通过 downloader.py 的统一网络配置从远程 URL 加载清单 JSON（P2-2）。"""
-        data = fetch_json(url, timeout=timeout)
-        return cls.from_dict(data, default_source=url)
+    def from_url(
+        cls,
+        url: str,
+        timeout: float = 15.0,
+        *,
+        expected_sha256: Optional[str] = None,
+    ) -> PatchCatalog:
+        """从远程 URL 加载清单；可用清单文件本身的 SHA256 锁定内容（P0 供应链防护）。"""
+        raw = fetch_bytes(url, timeout=timeout)
+        actual_sha256 = hashlib.sha256(raw).hexdigest()
+        if expected_sha256 is not None:
+            expected = expected_sha256.strip().lower()
+            if not cls._SHA256_PATTERN.match(expected):
+                raise ValueError("清单 SHA256 必须为 64 位十六进制值")
+            if actual_sha256 != expected:
+                raise ValueError(
+                    f"远程清单 SHA256 校验失败: 预期 {expected}，实际 {actual_sha256}"
+                )
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+        except ValueError as exc:
+            raise ValueError(f"远程清单不是有效的 JSON: {exc}") from exc
+        catalog = cls.from_dict(data, default_source=url)
+        catalog.remote_sha256 = actual_sha256
+        return catalog
 
     @classmethod
     def load(cls, source: Optional[Union[str, Path]] = None) -> PatchCatalog:
@@ -171,14 +195,36 @@ class PatchCatalog:
         *,
         target_path: Optional[Union[str, Path]] = None,
         timeout: float = 15.0,
+        expected_sha256: Optional[str] = None,
+        allow_untrusted: bool = False,
     ) -> bool:
         """从远程 URL 拉取新版清单并增量合并到本地 catalog.json，保留 .bak 备份（P2-2）。
 
+        - 默认拒绝更新未经校验的远程清单：清单可同时替换补丁链接与预期哈希，
+          必须提供清单文件自身的 expected_sha256，或显式 allow_untrusted=True
+        - 远程清单合并前必须通过 validate()
         - 校验远程 version 字段比当前 version 新才执行覆盖合并
         - 合并策略：同 id 的条目以远程为准，本地独有条目保留
         - 写入 %APPDATA%\\galgame-patcher\\catalog.json，并将合并前版本备份为 catalog.json.bak
         """
-        remote_catalog = self.from_url(url, timeout=timeout)
+        if expected_sha256 is None and not allow_untrusted:
+            raise ValueError(
+                "拒绝更新未经校验的远程清单：远程清单可以替换补丁链接与预期 SHA256。\n"
+                "请从可信渠道取得清单文件的 SHA256 后使用 expected_sha256"
+                "（CLI: --trust-catalog-sha256），"
+                "或在明确知晓风险时显式允许（CLI: --allow-untrusted-catalog）。"
+            )
+
+        remote_catalog = self.from_url(
+            url, timeout=timeout, expected_sha256=expected_sha256
+        )
+        errors, warnings = remote_catalog.validate()
+        if errors:
+            raise ValueError(
+                "远程清单未通过校验，已拒绝更新:\n  " + "\n  ".join(errors[:10])
+            )
+        for warning in warnings:
+            logger.warning("远程清单警告: %s", warning)
         if remote_catalog.version <= self.version:
             return False
 
@@ -219,8 +265,17 @@ class PatchCatalog:
                 merged.append(remote_entry)
                 seen_ids.add(remote_entry.id)
 
+        merged_catalog = PatchCatalog(entries=merged, version=remote_catalog.version)
+        merged_errors, _ = merged_catalog.validate()
+        if merged_errors:
+            raise ValueError(
+                "合并后的清单未通过校验，已拒绝保存:\n  "
+                + "\n  ".join(merged_errors[:10])
+            )
+
         self.entries = merged
         self.version = remote_catalog.version
+        self.remote_sha256 = remote_catalog.remote_sha256
         self.save_to_file(storage_path)
         return True
 

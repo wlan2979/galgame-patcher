@@ -42,6 +42,10 @@ _site_lock = threading.Lock()
 _next_request: dict[str, float] = {}
 _robots_cache: dict[str, tuple[float, urllib.robotparser.RobotFileParser, Optional[str]]] = {}
 _CHUNK_SIZE = 64 * 1024
+# 远程补丁默认上限 4 GiB，防止无 Content-Length 的无限流写满磁盘。
+DEFAULT_MAX_DOWNLOAD_BYTES = 4 * 1024 ** 3
+# 网页/清单等元数据响应默认上限 16 MiB。
+_DEFAULT_METADATA_MAX_BYTES = 16 * 1024 ** 2
 _FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\r\n]+)")
 _FILENAME_RE = re.compile(r'filename\s*=\s*"?([^";\r\n]+)"?')
 
@@ -74,8 +78,9 @@ _TRUSTED_PATCH_DOMAINS: tuple[str, ...] = (
 # 可直接在 %APPDATA%\galgame-patcher\sources.json 的 trusted_github_owners 中配置。
 _TRUSTED_GITHUB_OWNERS: tuple[str, ...] = ()
 
-# GitHub 仓库搜索的最低 star 门槛
-DEFAULT_MIN_GITHUB_STARS = 10
+# GitHub 仓库搜索的最低 star 门槛。真实 Galgame 补丁仓库多为 0–5 star，
+# 门槛过高会把有效结果全部过滤掉。
+DEFAULT_MIN_GITHUB_STARS = 2
 
 _NEKONYAN_PATCH_PAGE = "https://patches.nekonyansoft.com/"
 _KAGURA_PATCH_PAGE = "https://www.kaguragames.com/patch/"
@@ -198,6 +203,13 @@ _07TH_KEYWORDS: tuple[str, ...] = (
     "海猫",
     "白鹳",
 )
+
+# 中文/日文作品名对应的英文项目关键词，用于匹配 07th-Mod 的 GitHub 仓库。
+_07TH_TITLE_ALIASES: dict[str, tuple[str, ...]] = {
+    "寒蝉": ("higurashi",),
+    "海猫": ("umineko",),
+    "白鹳": ("ciconia",),
+}
 
 
 def get_user_sources_path() -> Path:
@@ -381,6 +393,16 @@ class _SearchRedirects(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
+def _read_response_limited(
+    response: Any, *, max_bytes: int, url: str
+) -> bytes:
+    """读取响应并拒绝超过上限的内容，避免元数据请求无限制占用内存。"""
+    data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"远程响应超过 {max_bytes} 字节上限，已中止: {url}")
+    return data
+
+
 def _fetch_metadata(
     url: str,
     *,
@@ -390,11 +412,12 @@ def _fetch_metadata(
     timeout: float,
     proxies: Optional[dict[str, str]],
     check_robots: bool = False,
+    max_bytes: int = _DEFAULT_METADATA_MAX_BYTES,
 ) -> bytes:
     target = urllib.parse.urlsplit(url)
     if target.scheme == "file":
         with open_url_request(url, method=method, data=data, headers=headers, timeout=timeout, proxies=proxies) as response:
-            return response.read()
+            return _read_response_limited(response, max_bytes=max_bytes, url=url)
     if target.scheme not in ("http", "https"):
         raise ValueError("搜索来源只支持 HTTP、HTTPS 或本地文件")
 
@@ -422,7 +445,7 @@ def _fetch_metadata(
                 url, method=method, data=data, headers=headers, timeout=request_timeout,
                 proxies=proxies, redirect_handler=redirect_handler,
             ) as response:
-                return response.read()
+                return _read_response_limited(response, max_bytes=max_bytes, url=url)
         except _SEARCH_ERRORS as exc:
             if isinstance(exc, urllib.error.HTTPError):
                 retryable = exc.code in _RETRY_HTTP
@@ -476,6 +499,19 @@ def _check_robots(url: str, *, deadline: float, proxies: Optional[dict[str, str]
         raise ValueError(denied)
     if not rules.can_fetch("galgame-patcher", url):
         raise ValueError("robots.txt 禁止自动访问此网页")
+
+
+def fetch_bytes(
+    url: str,
+    *,
+    timeout: float = 15.0,
+    proxies: Optional[dict[str, str]] = None,
+    max_bytes: int = _DEFAULT_METADATA_MAX_BYTES,
+) -> bytes:
+    """拉取远程原始字节（用于核对清单文件 SHA256 后再解析）。"""
+    return _fetch_metadata(
+        url, timeout=timeout, proxies=proxies, max_bytes=max_bytes
+    )
 
 
 def fetch_text(
@@ -913,6 +949,15 @@ def _tokenize_query(query: str) -> list[str]:
     return tokens
 
 
+_CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]")
+
+
+def _token_min_length(token: str) -> int:
+    """中文/日文两字作品名也应参与匹配，拉丁词仍要求至少 3 个字符。"""
+    return 2 if _CJK_RE.search(token) else 3
+
+
+
 def crawl_yuzusoft_patches(
     game_query: str = "",
     *,
@@ -1229,6 +1274,9 @@ def crawl_07th_mod_patches(
         )
         if isinstance(repos, list):
             tokens = _tokenize_query(game_query)
+            for keyword, aliases in _07TH_TITLE_ALIASES.items():
+                if keyword in query_lower:
+                    tokens.extend(aliases)
             for repo in repos:
                 if not isinstance(repo, dict):
                     continue
@@ -1237,7 +1285,9 @@ def crawl_07th_mod_patches(
                 desc = str(repo.get("description") or "")
                 stars = int(repo.get("stargazers_count") or 0)
                 haystack = f"{full_name} {desc}".lower()
-                if "07th" not in query_lower and not any(t in haystack for t in tokens if len(t) >= 3):
+                if "07th" not in query_lower and not any(
+                    t in haystack for t in tokens if len(t) >= _token_min_length(t)
+                ):
                     continue
                 if html_url:
                     candidates.append(
@@ -1405,8 +1455,12 @@ def download_patch(
     progress_callback: Optional[ProgressCallback] = None,
     timeout: float = DEFAULT_TIMEOUT,
     proxies: Optional[dict[str, str]] = None,
+    max_bytes: Optional[int] = DEFAULT_MAX_DOWNLOAD_BYTES,
 ) -> Path:
-    """下载补丁到本地缓存，拒绝裸可执行文件，并按需核对 SHA256。"""
+    """下载补丁到本地缓存，拒绝裸可执行文件，并按需核对 SHA256。
+
+    max_bytes 为 None 时关闭体积上限；默认 4 GiB，并在读取前检查 Content-Length。
+    """
     requested_name = Path(filename).name if filename else ""
     if is_executable_url(url) or _has_executable_suffix(requested_name):
         raise ValueError("远程下载不支持裸可执行文件或脚本")
@@ -1462,6 +1516,14 @@ def download_patch(
                 if content_length_raw and content_length_raw.isdigit()
                 else None
             )
+            if (
+                max_bytes is not None
+                and total_bytes is not None
+                and total_bytes > max_bytes
+            ):
+                raise ValueError(
+                    f"远程文件声明大小 {total_bytes} 字节，超过上限 {max_bytes} 字节: {url}"
+                )
 
             digest = hashlib.sha256()
             downloaded = 0
@@ -1474,9 +1536,13 @@ def download_patch(
                     chunk = response.read(_CHUNK_SIZE)
                     if not chunk:
                         break
+                    downloaded += len(chunk)
+                    if max_bytes is not None and downloaded > max_bytes:
+                        raise ValueError(
+                            f"下载体积超过上限 {max_bytes} 字节，已中止: {url}"
+                        )
                     fh.write(chunk)
                     digest.update(chunk)
-                    downloaded += len(chunk)
                     if progress_callback:
                         progress_callback(downloaded, total_bytes)
 

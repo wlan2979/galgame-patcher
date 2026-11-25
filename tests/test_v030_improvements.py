@@ -365,9 +365,10 @@ class TestV030Improvements(unittest.TestCase):
                 extract_archive(dummy_7z, out_dir)
 
         self.assertIn("Wrong password", str(ctx.exception))
-        self.assertEqual(len(recorded_cmds), 1)
+        extract_cmds = [cmd for cmd in recorded_cmds if len(cmd) > 1 and cmd[1] == "x"]
+        self.assertEqual(len(extract_cmds), 1)
         # 无密码时不应出现 "-p" 参数
-        self.assertFalse(any(arg.startswith("-p") for arg in recorded_cmds[0]))
+        self.assertFalse(any(arg.startswith("-p") for arg in extract_cmds[0]))
 
     def test_p2_1_manual_locator_and_deep_scan_non_steam(self) -> None:
         """P2-1: ManualLocator 手工登记与非 Steam 深度扫描均能定位含 Game.exe + data.xp3 的目录。"""
@@ -468,6 +469,7 @@ class TestV030Improvements(unittest.TestCase):
             updated = catalog.update_from_remote(
                 f"{base_url}/remote_catalog.json",
                 target_path=local_cat_path,
+                allow_untrusted=True,
             )
             self.assertTrue(updated)
             self.assertEqual(catalog.version, 2)

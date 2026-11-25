@@ -18,6 +18,39 @@ logger = logging.getLogger("galgame_patcher")
 
 _TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
 
+# 解压体积、压缩比与文件数量上限，防止压缩炸弹写满磁盘或拖死遍历。
+MAX_EXTRACTED_BYTES = 8 * 1024 ** 3
+MAX_COMPRESSION_RATIO = 1000
+MAX_ARCHIVE_ENTRIES = 200_000
+
+
+def _check_extracted_total(total_bytes: int, archive_path: Path) -> None:
+    if total_bytes > MAX_EXTRACTED_BYTES:
+        raise ValueError(
+            f"压缩包解压后体积超过上限 {MAX_EXTRACTED_BYTES} 字节，已拒绝"
+        )
+    archive_size = max(archive_path.stat().st_size, 1)
+    if total_bytes > archive_size * MAX_COMPRESSION_RATIO:
+        raise ValueError(
+            f"压缩包压缩比异常（{total_bytes} 字节约为压缩包的 "
+            f"{total_bytes // archive_size} 倍），疑似压缩炸弹，已拒绝"
+        )
+
+
+def _check_extraction_limits(
+    archive_path: Path, entries: Sequence[tuple[str, int]]
+) -> None:
+    """按归档元数据预估解压体积，在写盘前拒绝压缩炸弹。"""
+    total = 0
+    for index, (_name, size) in enumerate(entries, start=1):
+        if index > MAX_ARCHIVE_ENTRIES:
+            raise ValueError(
+                f"压缩包文件数量超过上限 {MAX_ARCHIVE_ENTRIES} 个，已拒绝"
+            )
+        if isinstance(size, int) and size > 0:
+            total += size
+    _check_extracted_total(total, archive_path)
+
 
 def is_supported_archive(path: Path) -> bool:
     """判断路径文件名是否为受支持的补丁压缩包格式。"""
@@ -100,16 +133,33 @@ def _clear_directory(directory: Path) -> None:
             item.unlink()
 
 
-def _verify_extracted_tree(extract_dir: Path) -> None:
-    """校验解压后的目录树，确保不存在指向外部的符号链接或路径越界。"""
+def _verify_extracted_tree(
+    extract_dir: Path, archive_path: Optional[Path] = None
+) -> None:
+    """校验解压后的目录树，确保没有越界链接，且体积与文件数在合理范围。"""
     resolved_base = extract_dir.resolve()
+    total_bytes = 0
+    count = 0
     for item in extract_dir.rglob("*"):
+        count += 1
+        if count > MAX_ARCHIVE_ENTRIES:
+            raise ValueError(
+                f"解压后文件数量超过上限 {MAX_ARCHIVE_ENTRIES} 个，已拒绝"
+            )
         if item.is_symlink():
             raise ValueError(f"压缩包包含不安全的符号链接: {item.name!r}")
         try:
             item.resolve().relative_to(resolved_base)
         except ValueError as exc:
             raise ValueError(f"解压文件路径越界: {item}") from exc
+        if item.is_file():
+            total_bytes += item.stat().st_size
+            if total_bytes > MAX_EXTRACTED_BYTES:
+                raise ValueError(
+                    f"解压后体积超过上限 {MAX_EXTRACTED_BYTES} 字节，已拒绝"
+                )
+    if archive_path is not None:
+        _check_extracted_total(total_bytes, archive_path)
 
 
 def _run_external(
@@ -228,9 +278,12 @@ def _extract_zip_with_zipfile(
             for info in zf.infolist()
             if info.filename and not info.filename.endswith(("/", "\\"))
         ]
-        # 前置校验所有成员路径（P1-2）
+        # 前置校验所有成员路径与解压体积（P1-2）
         for info in file_infos:
             resolve_safe_member_path(extract_dir, info.filename)
+        _check_extraction_limits(
+            archive_path, [(info.filename, info.file_size) for info in file_infos]
+        )
 
         is_encrypted = any(info.flag_bits & 0x1 for info in file_infos)
 
@@ -298,6 +351,9 @@ def _try_extract_aes_zip(
             ]
             for info in file_infos:
                 resolve_safe_member_path(extract_dir, info.filename)
+            _check_extraction_limits(
+                archive_path, [(info.filename, info.file_size) for info in file_infos]
+            )
             for pwd in password_list:
                 if pwd is None:
                     continue
@@ -318,9 +374,32 @@ def _try_extract_aes_zip(
 
     seven_z = _find_7z_executable()
     if seven_z:
+        _precheck_7z_limits(seven_z, archive_path)
         ok, _ = _try_extract_with_7z(seven_z, archive_path, extract_dir, password_list)
         return ok
     return False
+
+
+def _precheck_7z_limits(seven_z_exe: str, archive_path: Path) -> None:
+    """用 7z 的详细列表输出预估解压体积；无法解析时交由解压后校验兜底。"""
+    proc = _run_external([seven_z_exe, "l", "-slt", str(archive_path)])
+    if proc.returncode != 0 or not proc.stdout:
+        return
+    entries: list[tuple[str, int]] = []
+    current_name: Optional[str] = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("Path = "):
+            current_name = line[len("Path = ") :].strip()
+        elif line.startswith("Size = ") and current_name is not None:
+            raw_size = line[len("Size = ") :].strip()
+            try:
+                size = int(raw_size)
+            except ValueError:
+                size = 0
+            entries.append((current_name, size))
+            current_name = None
+    if entries:
+        _check_extraction_limits(archive_path, entries)
 
 
 def _try_extract_with_7z(
@@ -396,6 +475,9 @@ def _extract_tar(archive_path: Path, extract_dir: Path) -> None:
             if member.issym() or member.islnk() or not member.isfile():
                 raise ValueError(f"压缩包包含不支持的特殊文件类型: {member.name!r}")
             resolve_safe_member_path(extract_dir, member.name)
+        _check_extraction_limits(
+            archive_path, [(member.name, member.size) for member in members]
+        )
 
         for member in members:
             if member.isdir():
@@ -459,11 +541,25 @@ def _extract_7z(
                     for name in member_names:
                         resolve_safe_member_path(extract_dir, name)
                     _reject_library_archive_symlinks(sz)
+                    try:
+                        archive_infos = sz.list() or ()
+                    except Exception:
+                        archive_infos = ()
+                    _check_extraction_limits(
+                        archive_path,
+                        [
+                            (
+                                getattr(info, "filename", ""),
+                                int(getattr(info, "uncompressed", 0) or 0),
+                            )
+                            for info in archive_infos
+                        ],
+                    )
 
                     with tempfile.TemporaryDirectory(prefix="py7zr_stage_") as stage_str:
                         stage_dir = Path(stage_str)
                         sz.extractall(path=stage_dir)
-                        _verify_extracted_tree(stage_dir)
+                        _verify_extracted_tree(stage_dir, archive_path)
                         for staged_item in sorted(stage_dir.rglob("*")):
                             rel = staged_item.relative_to(stage_dir)
                             target = resolve_safe_member_path(extract_dir, rel.as_posix())
@@ -492,6 +588,7 @@ def _extract_7z(
     # 2. 尝试外部 7z CLI
     seven_z = _find_7z_executable()
     if seven_z:
+        _precheck_7z_limits(seven_z, archive_path)
         ok, detail = _try_extract_with_7z(
             seven_z, archive_path, extract_dir, password_list
         )
@@ -542,6 +639,10 @@ def _extract_rar(
             members = [m for m in rf.infolist() if not m.is_dir()]
             for member in members:
                 resolve_safe_member_path(extract_dir, member.filename)
+            _check_extraction_limits(
+                archive_path,
+                [(member.filename, int(getattr(member, "file_size", 0) or 0)) for member in members],
+            )
 
             for pwd in password_list:
                 _clear_directory(extract_dir)
@@ -649,4 +750,4 @@ def extract_archive(
     else:
         raise ValueError(f"不支持的压缩包格式: {archive_path.name}")
 
-    _verify_extracted_tree(extract_dir)
+    _verify_extracted_tree(extract_dir, archive_path)

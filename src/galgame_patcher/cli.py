@@ -130,6 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
     cat_update = catalog_sub.add_parser("update", help="从远程 URL 拉取并增量合并更新清单")
     cat_update.add_argument("url", help="远程清单 JSON URL")
     cat_update.add_argument("--catalog", help="要更新的本地清单文件路径（默认 %APPDATA%）")
+    trust_group = cat_update.add_mutually_exclusive_group()
+    trust_group.add_argument(
+        "--trust-catalog-sha256",
+        metavar="SHA256",
+        help="锁定远程清单文件本身的 SHA256（推荐，从可信渠道取得）",
+    )
+    trust_group.add_argument(
+        "--allow-untrusted-catalog",
+        action="store_true",
+        help="【高风险】不锁定清单文件，直接信任远程清单提供的链接与哈希",
+    )
 
     cat_list = catalog_sub.add_parser("list", help="列出清单中的所有游戏条目")
     cat_list.add_argument("--catalog", help="清单文件路径或远程 URL")
@@ -312,6 +323,39 @@ def _editable_catalog(source: Optional[str]) -> tuple[PatchCatalog, Path]:
         return PatchCatalog.from_file(path), path
     # 显式指定的新路径也允许从空白清单开始，方便首次创建。
     return PatchCatalog(entries=[]), path
+
+
+def _print_catalog_update_changes(
+    before: dict[str, dict[str, object]], catalog: PatchCatalog
+) -> None:
+    """逐条列出远程更新带来的新增与变更，提示用户核对链接和哈希来源。"""
+    changes: list[str] = []
+    for entry in catalog.entries:
+        old = before.get(entry.id)
+        if old is None:
+            changes.append(
+                f"[新增] {entry.id}: {entry.name} -> "
+                f"{entry.patch_url or '未配置 URL'} "
+                f"(SHA256: {'已配置' if entry.expected_sha256 else '未配置'})"
+            )
+            continue
+        old_url = str(old.get("patch_url") or "")
+        old_hash = str(old.get("expected_sha256") or "")
+        if (
+            old.get("name") == entry.name
+            and old_url == entry.patch_url
+            and old_hash == (entry.expected_sha256 or "")
+        ):
+            continue
+        changes.append(
+            f"[更新] {entry.id}: {entry.name}\n"
+            f"    URL: {old_url or '-'} -> {entry.patch_url or '-'}\n"
+            f"    SHA256: {old_hash or '-'} -> {entry.expected_sha256 or '-'}"
+        )
+    if changes:
+        print("本次清单变更（请核对链接与哈希来源）:")
+        for line in changes:
+            print(f"  {line}")
 
 
 def _handle_catalog_edit(args: argparse.Namespace) -> int:
@@ -508,14 +552,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0
 
             if args.catalog_action == "update":
+                before = {
+                    entry.id: entry.to_dict(include_password=False)
+                    for entry in catalog.entries
+                }
+                if args.allow_untrusted_catalog:
+                    print(
+                        "警告：正在信任未经哈希锁定的远程清单。"
+                        "清单作者可替换补丁链接与预期 SHA256，请自行确认来源。",
+                        file=sys.stderr,
+                    )
                 updated = catalog.update_from_remote(
                     args.url,
                     target_path=args.catalog,
+                    expected_sha256=args.trust_catalog_sha256,
+                    allow_untrusted=args.allow_untrusted_catalog,
                 )
                 if updated:
                     print(
-                        f"清单已更新至 v{catalog.version}（共 {len(catalog.entries)} 个条目）。"
+                        f"清单已更新至 v{catalog.version}"
+                        f"（共 {len(catalog.entries)} 个条目）。"
                     )
+                    if catalog.remote_sha256:
+                        print(f"远程清单 SHA256: {catalog.remote_sha256}")
+                    _print_catalog_update_changes(before, catalog)
                 else:
                     print(f"本地清单已是最新版本 (v{catalog.version})，无需更新。")
                 return 0
@@ -713,6 +773,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.to is not None and args.mode == "full":
                 parser.error("--to 不能与 --mode full 同用")
             mode = "keep-patches" if args.to is not None else (args.mode or "full")
+            if mode == "keep-patches":
+                history = patcher.rollback_history(args.game_dir)
+                if not history:
+                    print(
+                        "没有可撤回的逐次安装记录。如需完整还原，请使用 --mode full。",
+                        file=sys.stderr,
+                    )
+                    return 1
             return _report_patch_result(patcher.rollback(args.game_dir, mode=mode, to=args.to))
 
         if args.command == "status":
@@ -727,7 +795,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if status.latest_install:
                 applied = f"，安装时间 {status.applied_at}" if status.applied_at else ""
                 print(f"最近安装: {status.latest_install}{applied}")
-            if status.state in ("installed", "incomplete"):
+            if status.state in (
+                "installed",
+                "installed_no_history",
+                "incomplete",
+            ):
                 print(
                     f"备份内容: 原文件 {status.backed_up_files} 个，"
                     f"新增文件 {status.newly_added_files} 个，"

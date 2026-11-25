@@ -50,7 +50,15 @@ galpatch catalog remove my_game --catalog ./my_catalog.json
 
 `catalog verify` 检查链接能否响应 HEAD 请求；不支持 HEAD 的站点会自动改用只取首字节的 GET 复检。站点可能限制自动请求，状态异常时可在浏览器中核对发布页。`auto` 会比对补丁文件的 SHA256。`patch_version` 是补丁的版本说明，游戏构建版本需由使用者核对。安装器类补丁请依照发布者的安装说明。
 
-可用 `galpatch catalog update <清单URL> --catalog ./my_catalog.json` 拉取受信任的远程清单，已有文件会保留 `.bak` 副本。省略 `--catalog` 时使用默认用户清单。Windows 默认为 `%APPDATA%\galgame-patcher\catalog.json`，未设置 `APPDATA` 时为 `~/.config/galgame-patcher/catalog.json`。
+可用 `galpatch catalog update` 拉取远程清单，已有文件会保留 `.bak` 副本。远程清单能同时替换补丁链接和预期 SHA256，因此必须锁定清单文件本身：
+
+```bash
+# 从可信发布页取得清单文件的 SHA256 后锁定
+galpatch catalog update <清单URL> --catalog ./my_catalog.json \
+  --trust-catalog-sha256 <清单文件SHA256>
+```
+
+未提供 `--trust-catalog-sha256` 时会拒绝更新；明确知晓风险时才使用 `--allow-untrusted-catalog`。更新前会校验远程清单条目，合并后再次校验，并逐条打印新增/变更的 URL 与 SHA256 供核对。省略 `--catalog` 时使用默认用户清单。Windows 默认为 `%APPDATA%\galgame-patcher\catalog.json`，未设置 `APPDATA` 时为 `~/.config/galgame-patcher/catalog.json`。
 
 ## Python API
 
@@ -69,4 +77,4 @@ print(preview.message)
 
 调用 `rollback_patch("./MyGame")` 完整回滚，或传入 `mode="keep-patches"` 撤回最近一次安装。用 `GalgamePatcher().rollback_history("./MyGame")` 查询记录 ID 和 UTC 时间，再用 `rollback_patch("./MyGame", mode="keep-patches", to=record_id)` 恢复到某次安装完成后的状态。扫描结果的 `patched` 为 `None` 时，备份清单需要检查。
 
-查询状态可调用 `GalgamePatcher().install_status("./MyGame")`，返回 `InstallStatus`，其 `state` 为 `not_installed`、`installed`、`incomplete`、`rolled_back` 或 `invalid`。若上次安装中断（`incomplete`），调用 `recover_incomplete_install("./MyGame")` 完整回滚残留改动；它在加锁后再次确认清单仍为 `in_progress`，状态已变化时不会执行回滚。
+查询状态可调用 `GalgamePatcher().install_status("./MyGame")`，返回 `InstallStatus`，其 `state` 为 `not_installed`、`installed`、`installed_no_history`、`incomplete`、`rolled_back` 或 `invalid`。若上次安装中断（`incomplete`），调用 `recover_incomplete_install("./MyGame")` 完整回滚残留改动；它在加锁后再次确认清单仍为 `in_progress`，状态已变化时不会执行回滚。

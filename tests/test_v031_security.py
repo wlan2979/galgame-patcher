@@ -215,7 +215,7 @@ class TestV031Security(unittest.TestCase):
             raise AssertionError(f"Unexpected URL: {url}")
 
         with mock.patch("galgame_patcher.downloader.fetch_json", side_effect=_fake_fetch_json):
-            cands = crawl_github_patch_releases("sample")
+            cands = crawl_github_patch_releases("sample", min_stars=10)
 
         urls = [c.url for c in cands]
         # 1. star 数 3 的仓库不出现
@@ -236,7 +236,7 @@ class TestV031Security(unittest.TestCase):
         with mock.patch("galgame_patcher.downloader.fetch_json", side_effect=_fake_fetch_json), mock.patch.object(
             downloader, "_TRUSTED_GITHUB_OWNERS", ("trusted-dev",)
         ):
-            trusted_cands = crawl_github_patch_releases("sample")
+            trusted_cands = crawl_github_patch_releases("sample", min_stars=10)
         self.assertTrue(all(c.trusted for c in trusted_cands))
         self.assertTrue(all("白名单" in c.trust_reason for c in trusted_cands))
 
