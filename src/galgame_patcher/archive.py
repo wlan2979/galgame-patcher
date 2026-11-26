@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
+import os
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
-from typing import Optional, Sequence
+from typing import Optional
 
 from .models import COMMON_ARCHIVE_EXTENSIONS
 
@@ -35,6 +38,40 @@ def _check_extracted_total(total_bytes: int, archive_path: Path) -> None:
             f"压缩包压缩比异常（{total_bytes} 字节约为压缩包的 "
             f"{total_bytes // archive_size} 倍），疑似压缩炸弹，已拒绝"
         )
+
+
+def find_case_conflicts(rel_posix_paths: Sequence[str]) -> list[list[str]]:
+    """按 rel_posix.casefold() 检测大小写冲突（或重复）路径，返回冲突路径分组列表。"""
+    buckets: dict[str, list[str]] = {}
+    for raw in rel_posix_paths:
+        normalized = raw.replace("\\", "/").lstrip("/")
+        if not normalized:
+            continue
+        key = normalized.casefold()
+        buckets.setdefault(key, []).append(normalized)
+    return [paths for paths in buckets.values() if len(paths) > 1]
+
+
+def check_case_conflicts(
+    rel_posix_paths: Sequence[str], *, platform: Optional[str] = None
+) -> list[list[str]]:
+    """检测路径列表中的大小写冲突：Windows 上报错并列出冲突路径，非 Windows 记录警告。"""
+    conflicts = find_case_conflicts(rel_posix_paths)
+    if not conflicts:
+        return []
+    lines = [" <-> ".join(group) for group in conflicts]
+    joined = "\n  ".join(lines)
+    active_platform = sys.platform if platform is None else platform
+    if active_platform == "win32":
+        raise ValueError(
+            "补丁包含大小写冲突的文件路径（在 Windows 上会导致静默覆盖），已中止安装：\n"
+            f"  {joined}"
+        )
+    logger.warning(
+        "补丁包含大小写仅差异或重复的文件路径（在 Windows 上会互相覆盖）：\n  %s",
+        joined,
+    )
+    return conflicts
 
 
 def _check_extraction_limits(
@@ -167,18 +204,27 @@ def _run_external(
     timeout: float = 300.0,
 ) -> subprocess.CompletedProcess[str]:
     """静默执行外部解压 CLI 命令，禁用 stdin 并设置超时防止挂死（P1-3）。"""
-    kwargs: dict[str, object] = {
-        "stdin": subprocess.DEVNULL,
-        "capture_output": True,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "ignore",
-        "timeout": timeout,
-    }
-    if sys.platform == "win32":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        return subprocess.run(command, **kwargs)  # type: ignore[arg-type]
+        if sys.platform == "win32":
+            return subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        return subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=timeout,
+        )
     except subprocess.TimeoutExpired as exc:
         raise ValueError("解压超时，压缩包可能过大或已损坏") from exc
 
@@ -207,14 +253,89 @@ def _find_first_executable(candidates: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _bundled_bin_dirs() -> list[Path]:
+    """返回可能包含随包附带二进制（如 7za.exe / 7z.exe）的目录列表。"""
+    dirs: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        base = Path(str(meipass))
+        dirs.extend((base / "bin", base))
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        dirs.extend((exe_dir / "bin", exe_dir))
+    pkg_dir = Path(__file__).resolve().parent
+    dirs.append(pkg_dir / "bin")
+    return dirs
+
+
 def _find_7z_executable() -> Optional[str]:
+    env_override = (os.environ.get("GALGAME_PATCHER_7Z_PATH") or "").strip()
+    if env_override:
+        override_path = Path(env_override)
+        if override_path.is_file():
+            return str(override_path)
+
+    bundled_names = (
+        ("7z.exe", "7za.exe", "7z", "7za")
+        if sys.platform == "win32"
+        else ("7z", "7za", "7zz")
+    )
+    for bin_dir in _bundled_bin_dirs():
+        for name in bundled_names:
+            candidate = bin_dir / name
+            if candidate.is_file():
+                return str(candidate)
+
     return _find_first_executable(
         (
             "7z",
             "7za",
             r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files\7-Zip\7za.exe",
             r"C:\Program Files (x86)\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7za.exe",
         )
+    )
+
+
+def detect_rar_support() -> tuple[bool, str, str]:
+    """检测当前环境是否支持解压 .rar 压缩包，返回 (是否支持, 后端类型, 可读说明)。"""
+    seven_z = _find_7z_executable()
+    if seven_z:
+        return (
+            True,
+            "7z",
+            f"已检测到 7-Zip ({seven_z})，支持解压 .rar 压缩包",
+        )
+
+    unrar_exe = _find_unrar_executable()
+    if unrar_exe:
+        return (
+            True,
+            "unrar",
+            f"已检测到 UnRAR ({unrar_exe})，支持解压 .rar 压缩包",
+        )
+
+    bsdtar = _find_bsdtar_executable()
+    if importlib.util.find_spec("rarfile") is not None and bsdtar:
+        return (
+            True,
+            "rarfile+bsdtar",
+            f"已检测到 rarfile 与系统 bsdtar ({bsdtar})，仅支持部分无密码 RAR；加密 RAR 或 RAR5 建议安装 7-Zip 或 WinRAR",
+        )
+
+    if bsdtar:
+        return (
+            True,
+            "bsdtar",
+            f"仅检测到系统 bsdtar/tar ({bsdtar})，仅支持部分无密码 RAR；加密 RAR 或 RAR5 请安装 7-Zip 或 WinRAR",
+        )
+
+    return (
+        False,
+        "",
+        "当前环境未检测到 RAR 解压工具（7-Zip / UnRAR），无法直接解压 .rar 补丁。"
+        "请安装 7-Zip（https://www.7-zip.org/）或 WinRAR，或先手动解压为文件夹/ZIP 后再安装。",
     )
 
 
@@ -278,9 +399,10 @@ def _extract_zip_with_zipfile(
             for info in zf.infolist()
             if info.filename and not info.filename.endswith(("/", "\\"))
         ]
-        # 前置校验所有成员路径与解压体积（P1-2）
+        # 前置校验所有成员路径、大小写冲突与解压体积（P1-2）
         for info in file_infos:
             resolve_safe_member_path(extract_dir, info.filename)
+        check_case_conflicts([info.filename for info in file_infos])
         _check_extraction_limits(
             archive_path, [(info.filename, info.file_size) for info in file_infos]
         )
@@ -320,13 +442,13 @@ def _extract_zip_with_zipfile(
                 logger.debug("ZIP 尝试密码失败: %s: %s", type(exc).__name__, exc)
                 last_error = exc
                 continue
-            except NotImplementedError:
+            except NotImplementedError as exc:
                 if _try_extract_aes_zip(archive_path, extract_dir, password_list):
                     return
                 raise ValueError(
                     "ZIP 使用了标准库不支持的加密方式（如 AES），"
                     "请安装 7-Zip 或 pyzipper 后重试"
-                )
+                ) from exc
 
         logger.error("ZIP 已尝试 %d 个密码均失败: %s", len(passwords_to_try), last_error)
         raise ValueError(
@@ -341,7 +463,7 @@ def _try_extract_aes_zip(
     password_list: list[Optional[str]],
 ) -> bool:
     try:
-        import pyzipper  # type: ignore[import-not-found]
+        import pyzipper
 
         with pyzipper.AESZipFile(archive_path, "r") as zf:
             file_infos = [
@@ -351,6 +473,7 @@ def _try_extract_aes_zip(
             ]
             for info in file_infos:
                 resolve_safe_member_path(extract_dir, info.filename)
+            check_case_conflicts([info.filename for info in file_infos])
             _check_extraction_limits(
                 archive_path, [(info.filename, info.file_size) for info in file_infos]
             )
@@ -399,6 +522,7 @@ def _precheck_7z_limits(seven_z_exe: str, archive_path: Path) -> None:
             entries.append((current_name, size))
             current_name = None
     if entries:
+        check_case_conflicts([name for name, _size in entries if name and not name.endswith(("/", "\\"))])
         _check_extraction_limits(archive_path, entries)
 
 
@@ -469,12 +593,15 @@ def _try_extract_with_unrar(
 def _extract_tar(archive_path: Path, extract_dir: Path) -> None:
     with tarfile.open(archive_path, "r:*") as tf:
         members = tf.getmembers()
+        file_members = []
         for member in members:
             if member.isdir():
                 continue
             if member.issym() or member.islnk() or not member.isfile():
                 raise ValueError(f"压缩包包含不支持的特殊文件类型: {member.name!r}")
             resolve_safe_member_path(extract_dir, member.name)
+            file_members.append(member)
+        check_case_conflicts([member.name for member in file_members])
         _check_extraction_limits(
             archive_path, [(member.name, member.size) for member in members]
         )
@@ -529,7 +656,7 @@ def _extract_7z(
     # 1. 优先尝试 py7zr：先校验全部成员路径，再一次性解压到暂存目录后移入目标，
     #    避免对 solid 压缩包逐成员解压导致重复解码（O(n²)）。
     try:
-        import py7zr  # type: ignore[import-not-found]
+        import py7zr
 
         for pwd in password_list:
             _clear_directory(extract_dir)
@@ -545,6 +672,18 @@ def _extract_7z(
                         archive_infos = sz.list() or ()
                     except Exception:
                         archive_infos = ()
+                    if archive_infos:
+                        check_case_conflicts(
+                            [
+                                getattr(info, "filename", "")
+                                for info in archive_infos
+                                if not getattr(info, "is_directory", False)
+                            ]
+                        )
+                    else:
+                        check_case_conflicts(
+                            [n for n in member_names if n and not n.endswith(("/", "\\"))]
+                        )
                     _check_extraction_limits(
                         archive_path,
                         [
@@ -633,12 +772,13 @@ def _extract_rar(
 
     # 1. 尝试 rarfile 库（P1-1 异常分流 + P1-2 rf.open 逐成员安全落盘，不调用 extractall）
     try:
-        import rarfile  # type: ignore[import-not-found]
+        import rarfile
 
         with rarfile.RarFile(archive_path) as rf:
             members = [m for m in rf.infolist() if not m.is_dir()]
             for member in members:
                 resolve_safe_member_path(extract_dir, member.filename)
+            check_case_conflicts([member.filename for member in members])
             _check_extraction_limits(
                 archive_path,
                 [(member.filename, int(getattr(member, "file_size", 0) or 0)) for member in members],
@@ -681,6 +821,7 @@ def _extract_rar(
     # 2. 尝试 7z / UnRAR CLI
     seven_z = _find_7z_executable()
     if seven_z:
+        _precheck_7z_limits(seven_z, archive_path)
         ok, detail = _try_extract_with_7z(
             seven_z, archive_path, extract_dir, password_list
         )

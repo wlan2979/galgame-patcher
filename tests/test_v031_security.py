@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import sys
+import os
 import tempfile
 import unittest
 import zipfile
@@ -37,13 +37,21 @@ class TestV031Security(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
+        self._appdata_tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
+        self._old_appdata = os.environ.get("GALGAME_PATCHER_APPDATA")
+        os.environ["GALGAME_PATCHER_APPDATA"] = self._appdata_tmp.name
         self.game_dir = self.root / "GameDir"
         self.game_dir.mkdir(parents=True)
         (self.game_dir / "Game.exe").write_bytes(b"ORIG_EXE")
         self.patcher = GalgamePatcher()
 
     def tearDown(self) -> None:
+        if self._old_appdata is None:
+            os.environ.pop("GALGAME_PATCHER_APPDATA", None)
+        else:
+            os.environ["GALGAME_PATCHER_APPDATA"] = self._old_appdata
+        self._appdata_tmp.cleanup()
         self._tmp.cleanup()
 
     def test_rule1_models_and_exports(self) -> None:
@@ -133,7 +141,7 @@ class TestV031Security(unittest.TestCase):
         self.assertIn("SHA256 与预期值一致", output.getvalue())
 
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(cli_main(args + ["0" * 64]), 1)
+            self.assertEqual(cli_main(args + ["0" * 64]), 3)
             self.assertEqual(cli_main(args + ["not-a-digest"]), 1)
         self.assertIn("SHA256 不匹配", errors.getvalue())
         self.assertIn("64 位十六进制值", errors.getvalue())
@@ -430,7 +438,7 @@ class TestV031Security(unittest.TestCase):
         self.assertEqual(code_vf, 0)
         self.assertIn("请确认来源可信", vf_buf.getvalue())
 
-        # CLI apply 传无哈希 URL 返回 1 且不下载
+        # CLI apply 传无哈希 URL 返回 5（安全策略拦截）且不下载
         err_buf = io.StringIO()
         with mock.patch("galgame_patcher.patcher.download_patch") as mocked_dl:
             with redirect_stderr(err_buf):
@@ -438,7 +446,7 @@ class TestV031Security(unittest.TestCase):
                     ["apply", "https://example.com/bad.zip", "--game-dir", str(self.game_dir)]
                 )
             mocked_dl.assert_not_called()
-        self.assertEqual(code_apply, 1)
+        self.assertEqual(code_apply, 5)
         self.assertIn("--allow-untrusted-url", err_buf.getvalue())
 
         # GUI 导入与结构检查（无 tkinter 时允许跳过）

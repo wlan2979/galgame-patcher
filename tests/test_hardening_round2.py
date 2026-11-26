@@ -7,6 +7,7 @@ import hashlib
 import http.server
 import io
 import json
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -130,7 +131,7 @@ class TestCatalogTrust(unittest.TestCase):
 
     def test_update_rejects_wrong_pin(self) -> None:
         code, _out, err = self._run("--trust-catalog-sha256", "b" * 64)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("SHA256 校验失败", err)
 
     def test_update_with_correct_pin_prints_changes(self) -> None:
@@ -363,6 +364,18 @@ class TestSkippedAndStatus(unittest.TestCase):
 
 
 class TestSearchFixes(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_appdata = os.environ.get("GALGAME_PATCHER_APPDATA")
+        os.environ["GALGAME_PATCHER_APPDATA"] = str(Path(self._tmp.name) / "appdata")
+
+    def tearDown(self) -> None:
+        if self._old_appdata is None:
+            os.environ.pop("GALGAME_PATCHER_APPDATA", None)
+        else:
+            os.environ["GALGAME_PATCHER_APPDATA"] = self._old_appdata
+        self._tmp.cleanup()
+
     def test_07th_two_char_chinese_query_matches_english_repo(self) -> None:
         repos = [
             {

@@ -4,9 +4,71 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Union
+
+_SIZE_SPEC_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?i?b?)\s*$",
+    re.IGNORECASE,
+)
+_SIZE_UNIT_MULTIPLIERS: dict[str, int] = {
+    "": 1,
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "kib": 1024,
+    "m": 1024 ** 2,
+    "mb": 1024 ** 2,
+    "mib": 1024 ** 2,
+    "g": 1024 ** 3,
+    "gb": 1024 ** 3,
+    "gib": 1024 ** 3,
+    "t": 1024 ** 4,
+    "tb": 1024 ** 4,
+    "tib": 1024 ** 4,
+}
+
+
+def parse_size_bytes(raw: Union[str, int]) -> int:
+    """将体积字符串（如 '2G'、'500M'、'1024K'、'1.5GB'）或整数解析为字节数。"""
+    if isinstance(raw, bool):
+        raise ValueError(f"无效的体积大小: {raw!r}")
+    if isinstance(raw, int):
+        if raw < 0:
+            raise ValueError(f"体积上限不能为负数: {raw}")
+        return raw
+    text = str(raw).strip()
+    match = _SIZE_SPEC_RE.match(text)
+    if not match:
+        raise ValueError(
+            f"无效的体积格式: {raw!r}（示例: 500M、2G、1024K、1048576）"
+        )
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    multiplier = _SIZE_UNIT_MULTIPLIERS.get(unit)
+    if multiplier is None:
+        raise ValueError(f"不支持的体积单位: {raw!r}")
+    result = int(value * multiplier)
+    if result < 0:
+        raise ValueError(f"体积上限不能为负数: {raw!r}")
+    return result
+
+
+def format_size_bytes(size_bytes: int) -> str:
+    """将字节数格式化为人类可读体积字符串。"""
+    size = max(0, int(size_bytes))
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{size} B"
 
 COMMON_PATCH_EXTENSIONS: tuple[str, ...] = (
     ".xp3",
@@ -150,6 +212,10 @@ class UntrustedSourceError(RuntimeError):
         super().__init__(message)
 
 
+class VerificationError(ValueError):
+    """当文件或清单的 SHA256 哈希校验或完整性校验失败时抛出。"""
+
+
 @dataclass
 class GameProfile:
     """描述目标 Galgame 的定位信息与补丁安装配置。"""
@@ -175,9 +241,29 @@ class PatchResult:
     failed_files: list[str] = field(default_factory=list)
     failed_reasons: dict[str, str] = field(default_factory=dict)
     verified: bool = False
+    verification_failed: bool = False
+    pruned_snapshots: list[str] = field(default_factory=list)
+    pruned_bytes: int = 0
 
     def failure_details(self) -> str:
         return "\n".join(f"  {path}: {reason}" for path, reason in self.failed_reasons.items())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "game_dir": str(self.game_dir),
+            "installed_files": list(self.installed_files),
+            "backed_up_files": list(self.backed_up_files),
+            "skipped_files": list(self.skipped_files),
+            "backup_dir": str(self.backup_dir) if self.backup_dir else None,
+            "message": self.message,
+            "failed_files": list(self.failed_files),
+            "failed_reasons": dict(self.failed_reasons),
+            "verified": self.verified,
+            "verification_failed": self.verification_failed,
+            "pruned_snapshots": list(self.pruned_snapshots),
+            "pruned_bytes": self.pruned_bytes,
+        }
 
 
 @dataclass
@@ -246,8 +332,8 @@ class CatalogEntry:
             source=str(data.get("source") or default_source),
         )
 
-    def to_dict(self, *, include_password: bool = True) -> dict[str, Any]:
-        """序列化为可保存为 JSON 的字典；导出分享时可关闭密码字段。"""
+    def to_dict(self, *, include_password: bool = False) -> dict[str, Any]:
+        """序列化为可保存为 JSON 的字典；默认不输出明文解压密码。"""
         payload: dict[str, Any] = {
             "id": self.id,
             "name": self.name,
@@ -276,6 +362,20 @@ class InstalledGameStatus:
     game_dir: Optional[Path] = None
     patched: Optional[bool] = False
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.entry.id,
+            "name": self.entry.name,
+            "steam_app_id": self.entry.steam_app_id,
+            "install_dir_name": self.entry.install_dir_name,
+            "executable_name": self.entry.executable_name,
+            "patch_version": self.entry.patch_version,
+            "source": self.entry.source,
+            "installed": self.installed,
+            "game_dir": str(self.game_dir) if self.game_dir else None,
+            "patched": self.patched,
+        }
+
 
 INSTALL_STATE_LABELS: dict[str, str] = {
     "not_installed": "未安装补丁",
@@ -301,6 +401,9 @@ class InstallStatus:
     created_dirs: int = 0
     history: list[tuple[str, str]] = field(default_factory=list)
     message: str = ""
+    backup_size_bytes: int = 0
+    baseline_size_bytes: int = 0
+    snapshot_count: int = 0
 
     @property
     def state_label(self) -> str:
@@ -317,6 +420,10 @@ class InstallStatus:
             "backed_up_files": self.backed_up_files,
             "newly_added_files": self.newly_added_files,
             "created_dirs": self.created_dirs,
+            "backup_size_bytes": self.backup_size_bytes,
+            "backup_size_human": format_size_bytes(self.backup_size_bytes),
+            "baseline_size_bytes": self.baseline_size_bytes,
+            "snapshot_count": self.snapshot_count,
             "history": [
                 {"id": record_id, "applied_at": applied_at}
                 for record_id, applied_at in self.history
@@ -326,8 +433,39 @@ class InstallStatus:
 
 
 @dataclass
+class BackupPruneResult:
+    """记录一次备份快照清理的结果。"""
+
+    game_dir: Path
+    removed_snapshots: list[str] = field(default_factory=list)
+    kept_snapshots: list[str] = field(default_factory=list)
+    freed_bytes: int = 0
+    remaining_bytes: int = 0
+    baseline_preserved: bool = False
+    baseline_bytes: int = 0
+    dry_run: bool = False
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "game_dir": str(self.game_dir),
+            "removed_snapshots": list(self.removed_snapshots),
+            "kept_snapshots": list(self.kept_snapshots),
+            "freed_bytes": self.freed_bytes,
+            "freed_human": format_size_bytes(self.freed_bytes),
+            "remaining_bytes": self.remaining_bytes,
+            "remaining_human": format_size_bytes(self.remaining_bytes),
+            "baseline_preserved": self.baseline_preserved,
+            "baseline_bytes": self.baseline_bytes,
+            "baseline_human": format_size_bytes(self.baseline_bytes),
+            "dry_run": self.dry_run,
+            "message": self.message,
+        }
+
+
+@dataclass
 class PatchFileInspection:
-    """本地补丁文件核验结果，用于在安装前向用户展示体积、时间与 SHA256 摘要。"""
+    """本地补丁文件核验结果，用于在安装前向用户展示体积、时间、压缩包支持度与 SHA256 摘要。"""
 
     path: Path
     size: int
@@ -335,9 +473,28 @@ class PatchFileInspection:
     modified_at: str
     is_archive: bool
     is_bare_executable: bool
+    archive_format: str = ""
+    rar_supported: Optional[bool] = None
+    rar_support_detail: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "size": self.size,
+            "size_human": format_size_bytes(self.size),
+            "sha256": self.sha256,
+            "modified_at": self.modified_at,
+            "is_archive": self.is_archive,
+            "is_bare_executable": self.is_bare_executable,
+            "archive_format": self.archive_format,
+            "rar_supported": self.rar_supported,
+            "rar_support_detail": self.rar_support_detail,
+            "warnings": list(self.warnings),
+        }
 
     def describe(self) -> str:
-        """输出包含文件类型、大小、修改时间与 SHA256 的多行可读摘要。"""
+        """输出包含文件类型、大小、修改时间、SHA256 与前置提示的多行可读摘要。"""
         if self.is_bare_executable:
             kind = "裸可执行文件"
         elif self.is_archive:
@@ -346,13 +503,18 @@ class PatchFileInspection:
             kind = "补丁文件"
 
         size_mb = self.size / (1024 * 1024)
-        return (
-            f"文件: {self.path}\n"
-            f"类型: {kind}\n"
-            f"大小: {self.size} 字节 ({size_mb:.2f} MB)\n"
-            f"修改时间: {self.modified_at}\n"
-            f"SHA256: {self.sha256}"
-        )
+        lines = [
+            f"文件: {self.path}",
+            f"类型: {kind}",
+            f"大小: {self.size} 字节 ({size_mb:.2f} MB)",
+            f"修改时间: {self.modified_at}",
+            f"SHA256: {self.sha256}",
+        ]
+        if self.rar_support_detail:
+            lines.append(f"RAR 支持: {self.rar_support_detail}")
+        for warning in self.warnings:
+            lines.append(f"提示: {warning}")
+        return "\n".join(lines)
 
 
 @dataclass

@@ -7,15 +7,17 @@ import json
 import logging
 import re
 import shutil
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Union
 
 from .downloader import check_url_head, fetch_bytes
 from .locator import ManualLocator, SteamLocator, deep_scan_games
 from .models import (
     CatalogEntry,
     InstalledGameStatus,
+    VerificationError,
     get_appdata_dir,
 )
 
@@ -146,7 +148,7 @@ class PatchCatalog:
             if not cls._SHA256_PATTERN.match(expected):
                 raise ValueError("清单 SHA256 必须为 64 位十六进制值")
             if actual_sha256 != expected:
-                raise ValueError(
+                raise VerificationError(
                     f"远程清单 SHA256 校验失败: 预期 {expected}，实际 {actual_sha256}"
                 )
         try:
@@ -171,9 +173,9 @@ class PatchCatalog:
         self,
         path: Optional[Union[str, Path]] = None,
         *,
-        include_passwords: bool = True,
+        include_passwords: bool = False,
     ) -> Path:
-        """将当前清单保存为 JSON 文件；导出分享时可关闭明文解压密码。"""
+        """将当前清单保存为 JSON 文件；默认不写入明文解压密码。"""
         target = Path(path) if path is not None else self.default_storage_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -411,7 +413,7 @@ class PatchCatalog:
         for entry in self.entries:
             game_dir: Optional[Path] = None
             installed = False
-            patched = False
+            patched: Optional[bool] = False
 
             try:
                 game_dir = active_locator.locate(

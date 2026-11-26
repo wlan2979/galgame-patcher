@@ -22,11 +22,11 @@ galpatch gui
 
 | 平台 | 工具与测试 |
 | --- | --- |
-| Windows | 提供 x64 独立版。Python 版支持 Windows 注册表和 Steam 安装目录探测。CI 测试 Python 3.9 和 3.11–3.13。 |
-| Linux | 从 wheel 或源码安装。Ubuntu 上的 CI 测试 Python 3.9 和 3.11–3.13。使用 GUI 需要 Tk，例如 Debian/Ubuntu 的 `python3-tk`。 |
+| Windows | 提供 x64 独立版。Python 版支持 Windows 注册表和 Steam 安装目录探测。CI 测试 Python 3.9–3.13。 |
+| Linux | 从 wheel 或源码安装。Ubuntu 上的 CI 测试 Python 3.9–3.13。使用 GUI 需要 Tk，例如 Debian/Ubuntu 的 `python3-tk`。 |
 | macOS | 从 wheel 或源码安装。CI 测试 Python 3.13。GUI 需要带 Tk 的 Python。 |
 
-Python 包要求 **3.9 或更新**。普通 ZIP、Tar、补丁文件和文件夹只需标准库。源码安装时可用 `python -m pip install -e ".[archive]"` 加装 `py7zr` 和 `pyzipper`，用于 7z 和 AES 加密 ZIP。RAR 支持取决于环境里的解压工具，例如 7-Zip 或 UnRAR。加密包需要提供密码。
+Python 包要求 **3.9 或更新**。普通 ZIP、Tar、补丁文件和文件夹只需标准库。源码安装时可用 `python -m pip install -e ".[archive]"` 加装 `py7zr` 和 `pyzipper`，用于 7z 和 AES 加密 ZIP。Windows 独立版构建时会自动尝试打包 `7za.exe` / `7z.exe`（含配套 DLL）以提供开箱即用的 RAR/7z 解压支持；若未打包或源码运行，RAR 支持取决于环境里的 7-Zip 或 UnRAR，可在安装前通过 `galpatch verify-file ./patch.rar` 提前检测当前环境是否支持 RAR 解压。加密包需要提供密码。
 
 ## 搜索与安装
 
@@ -51,8 +51,22 @@ galpatch rollback ./MyGame --mode keep-patches
 | `galpatch rollback ./MyGame --mode keep-patches` | 撤回最近一次带备份的安装，保留较早的补丁。GUI 中勾选「回滚时仅撤回最近一次安装」即可使用。 |
 | `galpatch rollback ./MyGame --history` | 查看可用的安装记录 ID 和 UTC 时间。 |
 | `galpatch rollback ./MyGame --to <记录ID>` | 撤回指定记录之后的安装，保留该记录对应的游戏状态。 |
-| `galpatch status ./MyGame` | 查看补丁状态、备份清单、最近安装时间与安装历史；加 `--json` 输出机器可读结果。 |
+| `galpatch status ./MyGame` | 查看补丁状态、备份清单、备份体积、最近安装时间与安装历史；加 `--json` 输出机器可读结果。 |
+| `galpatch backup prune ./MyGame --keep 3 --max-size 2G` | 清理超出数量或体积上限的历史快照，始终保留首次安装前的原始基线。 |
 | `galpatch recover ./MyGame` | 上次安装被中断时，完整回滚残留改动；确认后执行，非交互环境加 `--yes`。 |
+
+### CLI JSON 输出与退出码
+
+除 `gui` 外，所有 CLI 子命令（`apply`、`auto`、`rollback`、`scan`、`locate`、`status`、`recover`、`backup prune`、`search`、`sites`、`verify-file`、`add-game`、`hash` 及 `catalog` 各子命令）均支持 `--json` 输出结构化 JSON，便于脚本集成。
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 成功 |
+| `1` | 通用失败（参数无效、文件或目录不存在、网络或 I/O 错误等） |
+| `2` | 游戏正在运行或目标文件被占用（`GameRunningError`） |
+| `3` | 校验失败（SHA256 不匹配、写后完整性校验失败、远程清单哈希不匹配或 `catalog validate` 校验不通过） |
+| `4` | 并发锁冲突（另一个 `galgame-patcher` 实例正在操作同一游戏目录） |
+| `5` | 安全策略拦截（未经审核且未锁定 SHA256 的远程来源） |
 
 单次撤回记录从 v0.3.6 起随备份保存。旧版备份支持完整回滚。使用 `--no-backup` 完成一次安装会中断单次撤回时间线，之前的完整回滚备份仍可用；此时 `status` 会显示「已安装补丁（不支持逐次撤回）」，仍可完整回滚。若安装中途退出，`status` 会显示「上次安装未完成」，此时 `recover` 和 GUI 的「恢复未完成安装」可清理残留；继续安装前必须先回滚。
 

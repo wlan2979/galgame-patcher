@@ -31,9 +31,12 @@
 galpatch catalog validate --catalog ./my_catalog.json
 galpatch catalog list --catalog ./my_catalog.json
 galpatch catalog verify --catalog ./my_catalog.json
+galpatch catalog export ./shared_catalog.json --catalog ./my_catalog.json
 galpatch auto my_game --catalog ./my_catalog.json --game-dir ./MyGame --dry-run
 galpatch auto my_game --catalog ./my_catalog.json --game-dir ./MyGame
 ```
+
+出于安全考虑，保存和导出清单时默认**不写入** `archive_password` 明文密码（包括 `catalog add`、`catalog update` 与默认导出）。安装加密补丁时请通过 `--password` 临时提供密码；仅在确实需要备份含密码副本时，显式使用 `galpatch catalog export <输出文件> --include-passwords`。
 
 也可以用命令逐条维护清单，不必手写 JSON。`catalog add` 按 `id` 新增或覆盖条目；省略的可选字段会保留原值：
 

@@ -7,8 +7,9 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Union
 
 from .models import GALGAME_ARCHIVE_INDICATORS, GameProfile, get_appdata_dir
 

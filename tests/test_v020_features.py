@@ -347,6 +347,7 @@ class TestV020Features(unittest.TestCase):
 
         import gc
         import logging
+
         from galgame_patcher import gui
 
         self.assertTrue(callable(gui.launch_gui))

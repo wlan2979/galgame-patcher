@@ -67,7 +67,7 @@ jobs:
       - name: Build standalone Windows executable
         env:
           PYTHONIOENCODING: utf-8
-        run: python scripts/build_exe.py
+        run: python scripts/build_exe.py --require-7z
 
       - name: Upload Windows executable artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

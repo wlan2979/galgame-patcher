@@ -7,6 +7,7 @@ import html.parser
 import http.client
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -16,15 +17,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.robotparser
+from collections.abc import Sequence
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Union
 
 from ._version import __version__
 from .models import (
     BARE_EXECUTABLE_SUFFIXES,
     COMMON_ARCHIVE_EXTENSIONS,
     OnlinePatchCandidate,
+    VerificationError,
     file_sha256,
     get_appdata_dir,
 )
@@ -81,6 +85,153 @@ _TRUSTED_GITHUB_OWNERS: tuple[str, ...] = ()
 # GitHub 仓库搜索的最低 star 门槛。真实 Galgame 补丁仓库多为 0–5 star，
 # 门槛过高会把有效结果全部过滤掉。
 DEFAULT_MIN_GITHUB_STARS = 2
+# GitHub 搜索结果默认本地缓存时间（秒），减少重复搜索触发限流。
+DEFAULT_GITHUB_SEARCH_CACHE_TTL = 600.0
+
+
+class GitHubRateLimitError(ValueError):
+    """GitHub API 触发速率限制时抛出的错误（附带重置时间提示）。"""
+
+
+def get_github_token() -> Optional[str]:
+    """从环境变量读取 GitHub API 访问令牌（优先 GALGAME_PATCHER_GITHUB_TOKEN，其次 GITHUB_TOKEN）。"""
+    for env_name in ("GALGAME_PATCHER_GITHUB_TOKEN", "GITHUB_TOKEN"):
+        value = (os.environ.get(env_name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _github_api_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+    }
+    token = get_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _format_github_rate_limit_error(exc: urllib.error.HTTPError) -> Optional[str]:
+    """当 GitHub API 返回 403/429 限流时，解析 X-RateLimit-Reset 并返回可读恢复时间提示。"""
+    if exc.code not in (403, 429):
+        return None
+    headers = exc.headers
+    remaining = (headers.get("X-RateLimit-Remaining") or "").strip() if headers else ""
+    reset_raw = (headers.get("X-RateLimit-Reset") or "").strip() if headers else ""
+    retry_after = (headers.get("Retry-After") or "").strip() if headers else ""
+
+    is_rate_limited = (
+        exc.code == 429
+        or remaining == "0"
+        or bool(reset_raw)
+        or bool(retry_after)
+    )
+    if not is_rate_limited and exc.code == 403:
+        # GitHub 未认证 API 403 绝大多数源于速率限制或访问受限，给出明确提示
+        return (
+            "GitHub API 返回 HTTP 403（可能触发速率限制），"
+            "可设置环境变量 GITHUB_TOKEN 或 GALGAME_PATCHER_GITHUB_TOKEN 提高限额后重试"
+        )
+
+    recovery_text = ""
+    if reset_raw:
+        try:
+            reset_ts = int(float(reset_raw))
+            reset_dt = datetime.fromtimestamp(reset_ts)
+            wait_seconds = max(0, int(reset_ts - time.time()))
+            wait_minutes = (wait_seconds + 59) // 60 if wait_seconds > 0 else 0
+            wait_hint = f"（约 {wait_minutes} 分钟后）" if wait_minutes > 0 else ""
+            recovery_text = (
+                f"，预计于 {reset_dt.strftime('%Y-%m-%d %H:%M:%S')} 恢复{wait_hint}"
+            )
+        except (ValueError, OSError, OverflowError):
+            pass
+    elif retry_after.isdecimal():
+        recovery_text = f"，请在约 {int(retry_after)} 秒后重试"
+
+    token_hint = (
+        ""
+        if get_github_token()
+        else "；可配置 GITHUB_TOKEN 或 GALGAME_PATCHER_GITHUB_TOKEN 环境变量提高限额"
+    )
+    return f"GitHub API 触发速率限制（HTTP {exc.code}）{recovery_text}{token_hint}"
+
+
+def _github_search_cache_dir() -> Path:
+    return get_appdata_dir() / "cache" / "github_search"
+
+
+def _github_search_cache_path(query: str, min_stars: int) -> Path:
+    cache_key = hashlib.sha256(
+        f"{query.strip().casefold()}\0{int(min_stars)}".encode()
+    ).hexdigest()
+    return _github_search_cache_dir() / f"{cache_key}.json"
+
+
+def _read_github_search_cache(
+    query: str, min_stars: int, *, ttl: float
+) -> Optional[dict[str, Any]]:
+    if ttl <= 0:
+        return None
+    cache_path = _github_search_cache_path(query, min_stars)
+    if not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        cached_at = float(payload.get("cached_at", 0.0))
+        if time.time() - cached_at > ttl:
+            return None
+        repos = payload.get("repos")
+        releases = payload.get("releases")
+        if not isinstance(repos, list) or not isinstance(releases, dict):
+            return None
+        return {"repos": repos, "releases": releases}
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_github_search_cache(
+    query: str,
+    min_stars: int,
+    *,
+    repos: list[Any],
+    releases: dict[str, Any],
+) -> None:
+    cache_path = _github_search_cache_path(query, min_stars)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "cached_at": time.time(),
+            "repos": repos,
+            "releases": releases,
+        }
+        tmp_path = cache_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, cache_path)
+    except OSError as exc:
+        logger.debug("写入 GitHub 搜索本地缓存失败: %s", exc)
+
+
+def clear_github_search_cache() -> int:
+    """清除 GitHub 搜索本地缓存文件，返回删除的文件数量。"""
+    cache_dir = _github_search_cache_dir()
+    if not cache_dir.is_dir():
+        return 0
+    removed = 0
+    for item in cache_dir.glob("*.json"):
+        try:
+            item.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 _NEKONYAN_PATCH_PAGE = "https://patches.nekonyansoft.com/"
 _KAGURA_PATCH_PAGE = "https://www.kaguragames.com/patch/"
@@ -822,18 +973,49 @@ def crawl_github_patch_releases(
     timeout: float = 12.0,
     proxies: Optional[dict[str, str]] = None,
     on_failure: Optional[SearchFailureCallback] = None,
+    use_cache: bool = True,
+    cache_ttl: float = DEFAULT_GITHUB_SEARCH_CACHE_TTL,
 ) -> list[OnlinePatchCandidate]:
-    """通过 GitHub 公开 API 搜索游戏相关开源补丁仓库及其 Release 压缩包链接。"""
+    """通过 GitHub 公开 API 搜索游戏相关开源补丁仓库及其 Release 压缩包链接。
+
+    支持读取 GITHUB_TOKEN / GALGAME_PATCHER_GITHUB_TOKEN 携带 Bearer Token，
+    对 403 限流解析 X-RateLimit-Reset 给出恢复时间，并对结果做短时间本地缓存。
+    """
     query = game_query.strip()
     if not query:
         return []
 
-    encoded_q = urllib.parse.quote(f"{query} patch")
-    search_url = f"https://api.github.com/search/repositories?q={encoded_q}&per_page=10"
-    data = fetch_json(search_url, timeout=timeout, proxies=proxies)
-    repos = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(repos, list):
-        raise ValueError("GitHub 未返回仓库列表")
+    cached = (
+        _read_github_search_cache(query, min_stars, ttl=cache_ttl)
+        if use_cache
+        else None
+    )
+    github_headers = _github_api_headers()
+    cached_releases: Optional[dict[str, Any]] = None
+    fetched_releases: dict[str, Any] = {}
+    partial_failure = False
+
+    if cached is not None:
+        repos = cached["repos"]
+        cached_releases = cached["releases"]
+    else:
+        encoded_q = urllib.parse.quote(f"{query} patch")
+        search_url = f"https://api.github.com/search/repositories?q={encoded_q}&per_page=10"
+        try:
+            data = fetch_json(
+                search_url,
+                headers=github_headers,
+                timeout=timeout,
+                proxies=proxies,
+            )
+        except urllib.error.HTTPError as exc:
+            rate_msg = _format_github_rate_limit_error(exc)
+            if rate_msg:
+                raise GitHubRateLimitError(rate_msg) from exc
+            raise
+        repos = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(repos, list):
+            raise ValueError("GitHub 未返回仓库列表")
 
     candidates: list[OnlinePatchCandidate] = []
     seen_urls: set[str] = set()
@@ -843,6 +1025,7 @@ def crawl_github_patch_releases(
     }
     dropped_low_stars = 0
     skipped_executables = 0
+    rate_limited = False
 
     for repo in repos:
         if not isinstance(repo, dict):
@@ -880,16 +1063,37 @@ def crawl_github_patch_releases(
             else f"GitHub 第三方仓库（{stars} stars），发布者未经审核"
         )
 
-        rel_api = f"https://api.github.com/repos/{full_name}/releases/latest"
-        try:
-            rel_data = fetch_json(rel_api, timeout=timeout, proxies=proxies)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 404:
+        rel_data: Any = None
+        if cached_releases is not None:
+            rel_data = cached_releases.get(full_name)
+        elif not rate_limited:
+            rel_api = f"https://api.github.com/repos/{full_name}/releases/latest"
+            try:
+                rel_data = fetch_json(
+                    rel_api,
+                    headers=github_headers,
+                    timeout=timeout,
+                    proxies=proxies,
+                )
+                fetched_releases[full_name] = rel_data
+            except urllib.error.HTTPError as exc:
+                rate_msg = _format_github_rate_limit_error(exc)
+                if rate_msg:
+                    rate_limited = True
+                    partial_failure = True
+                    _report_search_failure(
+                        "GitHub Releases", GitHubRateLimitError(rate_msg), on_failure
+                    )
+                elif exc.code != 404:
+                    partial_failure = True
+                    _report_search_failure("GitHub Releases", exc, on_failure)
+                else:
+                    fetched_releases[full_name] = None
+                rel_data = None
+            except _SEARCH_ERRORS as exc:
+                partial_failure = True
                 _report_search_failure("GitHub Releases", exc, on_failure)
-            rel_data = None
-        except _SEARCH_ERRORS as exc:
-            _report_search_failure("GitHub Releases", exc, on_failure)
-            rel_data = None
+                rel_data = None
 
         if isinstance(rel_data, dict):
             tag_name = str(rel_data.get("tag_name") or "")
@@ -934,6 +1138,11 @@ def crawl_github_patch_releases(
                     bare_executable=is_executable_url(html_url),
                 )
             )
+
+    if use_cache and cached is None and not partial_failure:
+        _write_github_search_cache(
+            query, min_stars, repos=repos, releases=fetched_releases
+        )
 
     logger.info(
         "GitHub 搜索汇总：丢弃低 star 仓库 %d 个，跳过可执行文件资产 %d 个",
@@ -1269,6 +1478,7 @@ def crawl_07th_mod_patches(
     try:
         repos = fetch_json(
             "https://api.github.com/orgs/07th-mod/repos?per_page=15&sort=updated",
+            headers=_github_api_headers(),
             timeout=timeout,
             proxies=proxies,
         )
@@ -1311,8 +1521,16 @@ def crawl_07th_mod_patches(
 def _report_search_failure(
     source: str, error: Exception, on_failure: Optional[SearchFailureCallback]
 ) -> None:
-    if isinstance(error, urllib.error.HTTPError):
-        detail = f"HTTP {error.code}"
+    if isinstance(error, GitHubRateLimitError):
+        detail = str(error)
+    elif isinstance(error, urllib.error.HTTPError):
+        url_host = urllib.parse.urlsplit(error.geturl() or "").hostname or ""
+        rate_msg = (
+            _format_github_rate_limit_error(error)
+            if url_host == "api.github.com" or "github" in source.lower()
+            else None
+        )
+        detail = rate_msg or f"HTTP {error.code}"
     elif isinstance(error, TimeoutError) or (
         isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError)
     ):
@@ -1552,7 +1770,7 @@ def download_patch(
             if normalized_expected:
                 actual_hash = digest.hexdigest().lower()
                 if actual_hash != normalized_expected:
-                    raise ValueError(
+                    raise VerificationError(
                         f"下载补丁 SHA256 校验失败: 预期 {normalized_expected}，实际 {actual_hash}"
                     )
 

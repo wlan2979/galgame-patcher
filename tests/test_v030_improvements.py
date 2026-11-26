@@ -25,7 +25,6 @@ from galgame_patcher import (
     GameRunningError,
     ManualLocator,
     PatchCatalog,
-    SteamLocator,
     deep_scan_games,
     discover_patches_online,
     extract_archive,

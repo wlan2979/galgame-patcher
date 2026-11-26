@@ -16,8 +16,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from galgame_patcher import PatchCatalog, SteamLocator, extract_archive
-from galgame_patcher import downloader
+from galgame_patcher import PatchCatalog, SteamLocator, downloader, extract_archive
 from galgame_patcher.archive import _try_extract_with_7z
 from galgame_patcher.cli import main as cli_main
 from galgame_patcher.locator import ManualLocator
@@ -144,7 +143,7 @@ class AuditFixTests(unittest.TestCase):
         self.assertEqual((out_dir / "top" / "a.xp3").read_bytes(), b"A")
         self.assertEqual((out_dir / "top" / "b.xp3").read_bytes(), b"B")
 
-    # 9. 导出清单默认不带明文密码
+    # 9. 保存与导出清单默认不带明文密码，仅显式传 include_passwords=True 时输出
     def test_catalog_export_can_omit_archive_password(self) -> None:
         catalog = PatchCatalog.from_dict(
             {
@@ -159,12 +158,12 @@ class AuditFixTests(unittest.TestCase):
             }
         )
         out_path = self.root / "export.json"
-        catalog.save_to_file(out_path, include_passwords=False)
+        catalog.save_to_file(out_path)
         raw = out_path.read_text(encoding="utf-8")
         self.assertNotIn("s3cret-pass", raw)
         self.assertNotIn("archive_password", raw)
 
-        catalog.save_to_file(out_path)
+        catalog.save_to_file(out_path, include_passwords=True)
         self.assertIn("s3cret-pass", out_path.read_text(encoding="utf-8"))
 
     # 10. HEAD 405 时用 Range GET 复检
