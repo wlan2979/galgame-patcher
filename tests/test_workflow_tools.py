@@ -278,7 +278,7 @@ class TestCatalogValidate(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(cli_main(["catalog", "validate", "--catalog", str(good)]), 0)
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(cli_main(["catalog", "validate", "--catalog", str(bad)]), 1)
+                self.assertEqual(cli_main(["catalog", "validate", "--catalog", str(bad)]), 3)
             self.assertIn("name 不能为空", err.getvalue())
 
 
@@ -344,7 +344,7 @@ class TestCatalogEditCli(unittest.TestCase):
             "--sha256",
             "not-a-hash",
         )
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertFalse(self.catalog_path.exists())
 
     def test_add_warns_when_remote_patch_has_no_sha256(self) -> None:

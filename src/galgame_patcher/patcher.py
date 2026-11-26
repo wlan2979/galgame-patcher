@@ -11,17 +11,24 @@ import shutil
 import sys
 import tempfile
 import time
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator, Optional, Sequence, Union
+from typing import Any, BinaryIO, Optional, Union
 
-from .archive import extract_archive, is_supported_archive
+from .archive import (
+    check_case_conflicts,
+    detect_rar_support,
+    extract_archive,
+    is_supported_archive,
+)
 from .catalog import PatchCatalog
 from .downloader import ProgressCallback, download_patch, is_url
 from .locator import SteamLocator
 from .models import (
     BARE_EXECUTABLE_SUFFIXES,
+    BackupPruneResult,
     CatalogEntry,
     ConcurrencyError,
     GameProfile,
@@ -30,10 +37,56 @@ from .models import (
     PatchFileInspection,
     PatchResult,
     UntrustedSourceError,
+    VerificationError,
     file_sha256,
+    format_size_bytes,
 )
 
 logger = logging.getLogger("galgame_patcher")
+
+_UNSET: Any = object()
+
+
+def _dir_size_bytes(directory: Path, *, exclude_names: Sequence[str] = ()) -> int:
+    """递归计算目录下普通文件的总字节数（跳过符号链接与指定顶层项）。"""
+    if not directory.is_dir():
+        return 0
+    excluded = set(exclude_names)
+    total = 0
+    stack: list[tuple[Path, int]] = [(directory, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if depth == 0 and entry.name in excluded:
+                continue
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    stack.append((entry, depth + 1))
+                elif entry.is_file():
+                    total += entry.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _snapshot_dirs(backup_root: Path) -> list[Path]:
+    """列出备份目录下全部 install-* 快照目录（跳过符号链接）。"""
+    if not backup_root.is_dir():
+        return []
+    result: list[Path] = []
+    try:
+        for item in sorted(backup_root.iterdir(), key=lambda p: p.name):
+            if item.name.startswith("install-") and item.is_dir() and not item.is_symlink():
+                result.append(item)
+    except OSError:
+        return []
+    return result
 
 
 def compute_sha256(file_path: Union[str, Path]) -> str:
@@ -42,20 +95,45 @@ def compute_sha256(file_path: Union[str, Path]) -> str:
 
 
 def inspect_patch_file(path: Union[str, Path]) -> PatchFileInspection:
-    """检查本地补丁文件的体积、修改时间、类型标记与 SHA256 摘要，供安装前人工核对。"""
+    """检查本地补丁文件的体积、修改时间、类型标记、RAR 解压支持度与 SHA256 摘要。"""
     target = Path(path)
     if not target.is_file():
         raise FileNotFoundError(f"补丁文件不存在: {target}")
 
     st = target.stat()
     modified_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+    is_archive = is_supported_archive(target)
+    lower_name = target.name.lower()
+    archive_format = ""
+    if is_archive:
+        for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tar", ".zip", ".7z", ".rar"):
+            if lower_name.endswith(suffix):
+                archive_format = suffix
+                break
+
+    rar_supported: Optional[bool] = None
+    rar_support_detail = ""
+    warnings: list[str] = []
+    if archive_format == ".rar":
+        supported, backend, detail = detect_rar_support()
+        rar_supported = supported
+        rar_support_detail = detail
+        if not supported:
+            warnings.append(detail)
+        elif backend in ("bsdtar", "rarfile+bsdtar"):
+            warnings.append(detail)
+
     return PatchFileInspection(
         path=target.resolve(),
         size=st.st_size,
         sha256=compute_sha256(target),
         modified_at=modified_at,
-        is_archive=is_supported_archive(target),
+        is_archive=is_archive,
         is_bare_executable=target.suffix.lower() in BARE_EXECUTABLE_SUFFIXES,
+        archive_format=archive_format,
+        rar_supported=rar_supported,
+        rar_support_detail=rar_support_detail,
+        warnings=warnings,
     )
 
 
@@ -128,10 +206,24 @@ class GalgamePatcher:
     """Galgame 补丁安装器，支持自动定位、在线下载、事务化备份与安全回滚。"""
 
     BACKUP_FOLDER_NAME = ".galpatch_backup"
+    DEFAULT_MAX_BACKUP_HISTORY = 5
+    DEFAULT_MAX_BACKUP_SIZE_BYTES = 2 * 1024 ** 3
 
-    def __init__(self, locator: Optional[SteamLocator] = None) -> None:
-        """初始化补丁安装器，可注入自定义 SteamLocator 实例。"""
+    def __init__(
+        self,
+        locator: Optional[SteamLocator] = None,
+        *,
+        max_backup_history: Optional[int] = DEFAULT_MAX_BACKUP_HISTORY,
+        max_backup_size_bytes: Optional[int] = DEFAULT_MAX_BACKUP_SIZE_BYTES,
+    ) -> None:
+        """初始化补丁安装器，可注入自定义 SteamLocator 实例及备份自动清理策略。"""
+        if max_backup_history is not None and max_backup_history < 0:
+            raise ValueError("max_backup_history 不能为负数")
+        if max_backup_size_bytes is not None and max_backup_size_bytes < 0:
+            raise ValueError("max_backup_size_bytes 不能为负数")
         self.locator = locator or SteamLocator()
+        self.max_backup_history = max_backup_history
+        self.max_backup_size_bytes = max_backup_size_bytes
 
     @staticmethod
     def _acquire_os_lock(handle: BinaryIO) -> None:
@@ -290,6 +382,8 @@ class GalgamePatcher:
         dry_run: bool = False,
         allow_untrusted_url: bool = False,
         source_origin: str = "manual",
+        max_backup_history: Any = _UNSET,
+        max_backup_size_bytes: Any = _UNSET,
     ) -> PatchResult:
         """将本地文件/目录/压缩包或受校验的远程 URL 补丁安装到目标 Galgame 目录。"""
         if is_url(patch_source):
@@ -323,7 +417,7 @@ class GalgamePatcher:
             actual_hash = file_sha256(source_path)
             expected_normalized = expected_sha256.strip().lower()
             if actual_hash != expected_normalized:
-                raise ValueError(
+                raise VerificationError(
                     f"补丁 SHA256 校验失败: 预期 {expected_normalized}，实际 {actual_hash}"
                 )
 
@@ -356,6 +450,16 @@ class GalgamePatcher:
                 force_locked=force_locked,
                 dry_run=dry_run,
                 skipped_files=skipped_files,
+                max_backup_history=(
+                    self.max_backup_history
+                    if max_backup_history is _UNSET
+                    else max_backup_history
+                ),
+                max_backup_size_bytes=(
+                    self.max_backup_size_bytes
+                    if max_backup_size_bytes is _UNSET
+                    else max_backup_size_bytes
+                ),
             )
 
     def apply_from_catalog(
@@ -610,10 +714,19 @@ class GalgamePatcher:
 
         backup_root = resolved / self.BACKUP_FOLDER_NAME
         manifest_path = backup_root / "manifest.json"
+        snapshots = _snapshot_dirs(backup_root)
+        backup_size_bytes = _dir_size_bytes(backup_root, exclude_names=(".lock",))
+        snapshot_names = [item.name for item in snapshots]
+        baseline_size_bytes = _dir_size_bytes(
+            backup_root, exclude_names=(".lock", *snapshot_names)
+        )
         status = InstallStatus(
             game_dir=resolved,
             state="not_installed",
             manifest_path=manifest_path if manifest_path.is_file() else None,
+            backup_size_bytes=backup_size_bytes,
+            baseline_size_bytes=baseline_size_bytes,
+            snapshot_count=len(snapshots),
         )
         if not manifest_path.is_file():
             return status
@@ -678,6 +791,180 @@ class GalgamePatcher:
             )
         return self.rollback(
             status.game_dir, mode="full", expected_status="in_progress"
+        )
+
+    def prune_backups(
+        self,
+        game_dir: Union[str, Path],
+        *,
+        keep: Optional[int] = 3,
+        max_size_bytes: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> BackupPruneResult:
+        """清理游戏目录中多余的 install-* 历史快照，始终保留首次安装前的原始基线。"""
+        if keep is not None and keep < 0:
+            raise ValueError("keep 不能为负数")
+        if max_size_bytes is not None and max_size_bytes < 0:
+            raise ValueError("max_size_bytes 不能为负数")
+
+        resolved_game_dir = Path(game_dir).resolve()
+        if not resolved_game_dir.is_dir():
+            raise FileNotFoundError(f"游戏目录不存在: {resolved_game_dir}")
+
+        backup_root = resolved_game_dir / self.BACKUP_FOLDER_NAME
+        if not backup_root.is_dir():
+            return BackupPruneResult(
+                game_dir=resolved_game_dir,
+                dry_run=dry_run,
+                message="该游戏目录没有补丁备份，无需清理。",
+            )
+
+        if dry_run:
+            return self._prune_backups_locked(
+                resolved_game_dir,
+                backup_root,
+                keep=keep,
+                max_size_bytes=max_size_bytes,
+                dry_run=True,
+            )
+
+        with self._directory_lock(resolved_game_dir):
+            return self._prune_backups_locked(
+                resolved_game_dir,
+                backup_root,
+                keep=keep,
+                max_size_bytes=max_size_bytes,
+                dry_run=False,
+            )
+
+    def _prune_backups_locked(
+        self,
+        game_dir: Path,
+        backup_root: Path,
+        *,
+        keep: Optional[int],
+        max_size_bytes: Optional[int],
+        dry_run: bool,
+    ) -> BackupPruneResult:
+        """在目录锁保护下（或 dry_run 只读模式）执行历史快照清理。"""
+        manifest_path = backup_root / "manifest.json"
+        snapshots = _snapshot_dirs(backup_root)
+        snapshot_sizes: dict[str, int] = {
+            snap.name: _dir_size_bytes(snap) for snap in snapshots
+        }
+        all_snapshot_names = [snap.name for snap in snapshots]
+        baseline_bytes = _dir_size_bytes(
+            backup_root, exclude_names=(".lock", *all_snapshot_names)
+        )
+        total_before = baseline_bytes + sum(snapshot_sizes.values())
+
+        manifest: Optional[dict[str, Any]] = None
+        active_ids: list[str] = []
+        baseline_preserved = (backup_root / "files").is_dir() or manifest_path.is_file()
+
+        if manifest_path.is_file():
+            manifest = self._read_backup_manifest(manifest_path)
+            raw_status = manifest.get("status", "committed")
+            if raw_status == "in_progress":
+                raise ValueError(
+                    "检测到上次安装未完成，无法清理备份。请先执行 galpatch recover 回滚残留改动。"
+                )
+            if raw_status == "committed" and manifest.get("latest_install") is not None:
+                active_ids = [
+                    record_id
+                    for record_id, _ in self._read_rollback_history(backup_root, manifest)
+                ]
+
+        active_set = set(active_ids)
+        orphan_ids = [name for name in all_snapshot_names if name not in active_set]
+
+        kept_ids = list(active_ids)
+        removed_active_ids: list[str] = []
+
+        if keep is not None and len(kept_ids) > keep:
+            removed_active_ids.extend(kept_ids[keep:])
+            kept_ids = kept_ids[:keep]
+
+        if max_size_bytes is not None:
+            current_total = baseline_bytes + sum(
+                snapshot_sizes.get(sid, 0) for sid in kept_ids
+            )
+            while kept_ids and current_total > max_size_bytes:
+                oldest = kept_ids.pop()
+                current_total -= snapshot_sizes.get(oldest, 0)
+                removed_active_ids.append(oldest)
+
+        removed_snapshots = list(dict.fromkeys(orphan_ids + removed_active_ids))
+        freed_bytes = sum(snapshot_sizes.get(name, 0) for name in removed_snapshots)
+
+        if not dry_run and removed_snapshots:
+            # 先原子截断链表引用，再删除快照目录，避免中途崩溃留下悬空引用。
+            if manifest is not None and len(kept_ids) < len(active_ids):
+                if kept_ids:
+                    oldest_kept_dir = backup_root / kept_ids[-1]
+                    undo_path = oldest_kept_dir / "undo.json"
+                    journal = json.loads(undo_path.read_text(encoding="utf-8"))
+                    prev = journal.get("previous_manifest")
+                    if isinstance(prev, dict) and "latest_install" in prev:
+                        journal["previous_manifest"] = {
+                            k: v for k, v in prev.items() if k != "latest_install"
+                        }
+                        _write_manifest_atomic(undo_path, journal)
+                elif "latest_install" in manifest:
+                    retained_manifest = {
+                        k: v for k, v in manifest.items() if k != "latest_install"
+                    }
+                    _write_manifest_atomic(manifest_path, retained_manifest)
+
+            for snap_name in removed_snapshots:
+                snap_dir = backup_root / snap_name
+                if snap_dir.is_dir() and not snap_dir.is_symlink():
+                    shutil.rmtree(snap_dir)
+
+        remaining_bytes = (
+            max(0, total_before - freed_bytes)
+            if dry_run
+            else _dir_size_bytes(backup_root, exclude_names=(".lock",))
+        )
+
+        over_limit_by_baseline = (
+            max_size_bytes is not None
+            and not kept_ids
+            and remaining_bytes > max_size_bytes
+            and baseline_preserved
+        )
+
+        prefix = "[仅预览 Dry-Run] " if dry_run else ""
+        if removed_snapshots:
+            verb = "将清理" if dry_run else "已清理"
+            baseline_note = "与首次安装前的原始基线" if baseline_preserved else ""
+            message = (
+                f"{prefix}{verb} {len(removed_snapshots)} 个历史快照，"
+                f"释放 {format_size_bytes(freed_bytes)}，"
+                f"保留最近 {len(kept_ids)} 次快照{baseline_note}"
+                f"（剩余备份体积 {format_size_bytes(remaining_bytes)}）。"
+            )
+        else:
+            message = (
+                f"{prefix}备份无需清理：当前共 {len(kept_ids)} 个历史快照，"
+                f"总备份体积 {format_size_bytes(remaining_bytes)}。"
+            )
+        if over_limit_by_baseline and max_size_bytes is not None:
+            message += (
+                f" 注意：原始基线本身占用 {format_size_bytes(baseline_bytes)}，"
+                f"超过上限 {format_size_bytes(max_size_bytes)}；为保障完整回滚已保留原始基线。"
+            )
+
+        return BackupPruneResult(
+            game_dir=game_dir,
+            removed_snapshots=removed_snapshots,
+            kept_snapshots=kept_ids,
+            freed_bytes=freed_bytes,
+            remaining_bytes=remaining_bytes,
+            baseline_preserved=baseline_preserved,
+            baseline_bytes=baseline_bytes,
+            dry_run=dry_run,
+            message=message,
         )
 
     def _read_install_journal(self, backup_root: Path, manifest: dict) -> tuple[Path, dict]:
@@ -811,9 +1098,8 @@ class GalgamePatcher:
     ) -> tuple[list[tuple[Path, Path]], list[str]]:
         """将各种补丁源解析为 (源文件, 目标路径) 映射列表及被跳过的保留目录路径。"""
         if source_path.is_dir():
-            return self._walk_source_dir(source_path, dest_root)
-
-        if is_supported_archive(source_path):
+            pairs, skipped = self._walk_source_dir(source_path, dest_root)
+        elif is_supported_archive(source_path):
             extract_archive(
                 source_path,
                 temp_dir,
@@ -827,9 +1113,19 @@ class GalgamePatcher:
                     top_dir = entries[0]
                     if not (dest_root / top_dir.name).exists():
                         effective_root = top_dir
-            return self._walk_source_dir(effective_root, dest_root)
+            pairs, skipped = self._walk_source_dir(effective_root, dest_root)
+        else:
+            pairs, skipped = [(source_path, dest_root / source_path.name)], []
 
-        return [(source_path, dest_root / source_path.name)], []
+        resolved_dest = dest_root.resolve()
+        rel_paths: list[str] = []
+        for _src_file, dst_file in pairs:
+            try:
+                rel_paths.append(dst_file.relative_to(dest_root).as_posix())
+            except ValueError:
+                rel_paths.append(dst_file.resolve().relative_to(resolved_dest).as_posix())
+        check_case_conflicts(rel_paths, platform=sys.platform)
+        return pairs, skipped
 
     def _walk_source_dir(
         self, source_dir: Path, dest_root: Path
@@ -860,6 +1156,8 @@ class GalgamePatcher:
         force_locked: bool = False,
         dry_run: bool = False,
         skipped_files: Optional[Sequence[str]] = None,
+        max_backup_history: Optional[int] = DEFAULT_MAX_BACKUP_HISTORY,
+        max_backup_size_bytes: Optional[int] = DEFAULT_MAX_BACKUP_SIZE_BYTES,
     ) -> PatchResult:
         """事务化安装补丁文件，支持前置占用检测、并发锁、写后校验与异常自动回滚。"""
         skipped = list(skipped_files or ())
@@ -1045,6 +1343,7 @@ class GalgamePatcher:
                             failed_files=[rel_posix],
                             failed_reasons={rel_posix: reason},
                             verified=False,
+                            verification_failed=True,
                         )
 
                 if backup:
@@ -1085,8 +1384,31 @@ class GalgamePatcher:
             if snapshot_dir is not None and not backup:
                 shutil.rmtree(snapshot_dir, ignore_errors=True)
 
+            pruned_snapshots: list[str] = []
+            pruned_bytes = 0
+            prune_note = ""
             if backup:
                 used_backup_dir: Optional[Path] = backup_root
+                if max_backup_history is not None or max_backup_size_bytes is not None:
+                    try:
+                        prune_res = self._prune_backups_locked(
+                            game_dir,
+                            backup_root,
+                            keep=max_backup_history,
+                            max_size_bytes=max_backup_size_bytes,
+                            dry_run=False,
+                        )
+                        if prune_res.removed_snapshots:
+                            pruned_snapshots = prune_res.removed_snapshots
+                            pruned_bytes = prune_res.freed_bytes
+                            prune_note = (
+                                f" 自动清理了 {len(pruned_snapshots)} 个超出上限的旧快照，"
+                                f"释放 {format_size_bytes(pruned_bytes)}"
+                                f"（保留最近 {len(prune_res.kept_snapshots)} 次与原始基线）。"
+                            )
+                            logger.info("%s", prune_res.message)
+                    except (OSError, ValueError) as exc:
+                        logger.warning("自动清理旧备份快照失败: %s", exc)
             else:
                 try:
                     for rel_posix in backed_up_this_run:
@@ -1106,9 +1428,11 @@ class GalgamePatcher:
                 skipped_files=skipped,
                 message=(
                     f"补丁安装成功：写入并校验 {len(installed_files)} 个文件，"
-                    f"备份 {len(backed_up_this_run)} 个已有文件。{skipped_note}"
+                    f"备份 {len(backed_up_this_run)} 个已有文件。{skipped_note}{prune_note}"
                 ),
                 verified=True,
+                pruned_snapshots=pruned_snapshots,
+                pruned_bytes=pruned_bytes,
             )
 
     @staticmethod
@@ -1200,3 +1524,20 @@ def rollback_patch(
     """一键回滚指定游戏目录补丁的便捷函数。"""
     patcher = GalgamePatcher()
     return patcher.rollback(game_dir=game_dir, mode=mode, to=to)
+
+
+def prune_backups(
+    game_dir: Union[str, Path],
+    *,
+    keep: Optional[int] = 3,
+    max_size_bytes: Optional[int] = None,
+    dry_run: bool = False,
+) -> BackupPruneResult:
+    """一键清理指定游戏目录多余历史快照的便捷函数（保留原始基线）。"""
+    patcher = GalgamePatcher()
+    return patcher.prune_backups(
+        game_dir=game_dir,
+        keep=keep,
+        max_size_bytes=max_size_bytes,
+        dry_run=dry_run,
+    )

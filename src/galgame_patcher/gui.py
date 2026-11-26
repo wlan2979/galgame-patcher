@@ -26,6 +26,20 @@ from .downloader import (
     load_user_sources,
     save_user_sources,
 )
+from .gui_logic import (
+    build_default_search_query,
+    compute_download_progress,
+    filter_game_statuses,
+    format_apply_confirm_message,
+    format_candidate_detail,
+    format_candidate_row,
+    format_install_state_summary,
+    format_patch_exception,
+    format_search_summary,
+    format_transfer_speed,
+    summarize_error_status,
+    validate_patch_task_inputs,
+)
 from .locator import ManualLocator, SteamLocator
 from .models import (
     CatalogEntry,
@@ -76,11 +90,7 @@ def _enable_windows_dpi_awareness() -> None:
 
 
 def _format_speed(bytes_per_sec: float) -> str:
-    if bytes_per_sec >= 1024 * 1024:
-        return f"{bytes_per_sec / (1024 * 1024):.2f} MB/s"
-    if bytes_per_sec >= 1024:
-        return f"{bytes_per_sec / 1024:.1f} KB/s"
-    return f"{bytes_per_sec:.0f} B/s"
+    return format_transfer_speed(bytes_per_sec)
 
 
 class GalgamePatcherGUI:
@@ -642,19 +652,15 @@ class GalgamePatcherGUI:
         elif kind == "search_done":
             candidates, query, failures = event[1], event[2], event[3]
             self.progress.configure(value=100)
-            msg = f"在线搜索 '{query}' 完成：找到 {len(candidates)} 条候选补丁。"
-            sources = "、".join(dict.fromkeys(source for source, _ in failures))
-            if sources:
-                msg += f" 来源未完成：{sources}。"
+            msg, failure_logs, warning_dialog = format_search_summary(
+                query, len(candidates), failures
+            )
             self._set_status(msg, is_error=bool(failures))
             self._append_log(msg)
-            for source, detail in failures:
-                self._append_log(f"来源未完成：{source}（{detail}）")
-            if failures and not candidates:
-                messagebox.showwarning(
-                    "搜索结果不完整",
-                    f"暂无候选结果。以下来源未完成搜索：{sources}。详情见运行日志。",
-                )
+            for line in failure_logs:
+                self._append_log(line)
+            if warning_dialog is not None:
+                messagebox.showwarning("搜索结果不完整", warning_dialog)
             else:
                 self._show_online_candidates_dialog(query, candidates)
         elif kind == "success":
@@ -672,8 +678,7 @@ class GalgamePatcherGUI:
             messagebox.showwarning(title, msg)
         elif kind == "error":
             err_msg = str(event[1])
-            summary = err_msg.splitlines()[0] if err_msg else "未知错误"
-            self._set_status(f"错误: {summary}", is_error=True)
+            self._set_status(summarize_error_status(err_msg), is_error=True)
             self._append_log(f"错误: {err_msg}")
             messagebox.showerror("操作失败", err_msg)
         else:
@@ -688,7 +693,7 @@ class GalgamePatcherGUI:
                 pass
         self._search_after_id = self.root.after(200, self._refresh_tree)
 
-    def _on_paste_shortcut(self, event: tk.Event) -> Optional[str]:  # type: ignore[type-arg]
+    def _on_paste_shortcut(self, event: object) -> Optional[str]:
         """在非输入框焦点下按 Ctrl+V 直接把剪贴板路径粘贴到补丁源（P3-1 #3）。"""
         focused = self.root.focus_get()
         if isinstance(focused, (ttk.Entry, tk.Entry, tk.Text)):
@@ -803,31 +808,14 @@ class GalgamePatcherGUI:
         for item_id in self.tree.get_children():
             self.tree.delete(item_id)
 
-        only_installed = self.only_installed_var.get()
-        keyword = self.search_var.get().strip().lower()
+        rows = filter_game_statuses(
+            self._statuses,
+            keyword=self.search_var.get(),
+            only_installed=self.only_installed_var.get(),
+        )
         self._filtered_indices = []
-
-        for idx, status in enumerate(self._statuses):
-            if only_installed and not status.installed:
-                continue
+        for idx, status, state_text in rows:
             entry = status.entry
-            if keyword:
-                haystack = (
-                    f"{entry.name} {entry.id} {entry.steam_app_id or ''} "
-                    f"{entry.install_dir_name or ''} {status.game_dir or ''}"
-                ).lower()
-                if keyword not in haystack:
-                    continue
-
-            if not status.installed:
-                state_text = "未安装"
-            elif status.patched is None:
-                state_text = "已安装 / 补丁状态待确认"
-            elif status.patched:
-                state_text = "已安装 / 已打补丁"
-            else:
-                state_text = "已安装 / 未打补丁"
-
             self.tree.insert(
                 "",
                 tk.END,
@@ -860,7 +848,12 @@ class GalgamePatcherGUI:
         self.patch_source_var.set("")
         self._inspected_key = None
         self._set_inspect_text("尚未导入本地补丁文件。请先通过“选择补丁文件...”导入并核对 SHA256。")
-        self.password_var.set(entry.archive_password or "")
+        # 出于安全考虑，不自动从清单回填明文解压密码，切换条目时清空输入框。
+        self.password_var.set("")
+        if entry.archive_password:
+            self._append_log(
+                f"提示：清单条目「{entry.name}」包含密码字段，出于安全考虑未自动回填，请在“解压密码”栏手动输入。"
+            )
         self.sha256_var.set(entry.expected_sha256 or "")
         self.target_subdir_var.set(entry.target_subdir or "")
 
@@ -879,13 +872,7 @@ class GalgamePatcherGUI:
             self.btn_recover.configure(state=tk.DISABLED)
             return
 
-        text = f"补丁状态: {status.state_label}"
-        if status.latest_install:
-            applied = f"（{status.applied_at}）" if status.applied_at else ""
-            text += f" — {status.latest_install}{applied}"
-        if status.state == "incomplete":
-            text += "，可点击「恢复未完成安装」回滚残留改动"
-        self.detail_state_var.set(text)
+        self.detail_state_var.set(format_install_state_summary(status))
         self.btn_recover.configure(
             state=(
                 tk.NORMAL
@@ -945,7 +932,7 @@ class GalgamePatcherGUI:
         if not path:
             return
         try:
-            self.catalog.save_to_file(path, include_passwords=False)
+            self.catalog.save_to_file(path)
             self._append_log(f"已导出清单到（不含明文解压密码）: {path}")
             messagebox.showinfo(
                 "导出成功",
@@ -1008,7 +995,8 @@ class GalgamePatcherGUI:
             messagebox.showwarning("提示", "请先填写或选择一个有效的游戏安装目录。")
             return
         if sys.platform == "win32":
-            os.startfile(game_dir)  # type: ignore[attr-defined]
+            startfile = os.startfile
+            startfile(game_dir)
         elif sys.platform == "darwin":
             subprocess.Popen(["open", game_dir])
         else:
@@ -1019,15 +1007,14 @@ class GalgamePatcherGUI:
         if self._busy:
             return
         selected = self.tree.selection()
-        default_query = ""
+        selected_entry: Optional[CatalogEntry] = None
         if selected:
             idx = int(selected[0])
             if idx < len(self._statuses):
-                entry = self._statuses[idx].entry
-                if entry.id != "example_game":
-                    default_query = entry.install_dir_name or entry.name
-        if not default_query and self.game_dir_var.get().strip():
-            default_query = Path(self.game_dir_var.get().strip()).name
+                selected_entry = self._statuses[idx].entry
+        default_query = build_default_search_query(
+            selected_entry, self.game_dir_var.get()
+        )
 
         query = self._prompt_search_query(default_query)
         if not query:
@@ -1139,22 +1126,11 @@ class GalgamePatcherGUI:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         for idx, cand in enumerate(candidates):
-            trust_text = "✔ 白名单" if cand.trusted else "未审核"
-            kind_text = "直链包" if cand.is_direct_download else "发布网页"
-            if cand.manual_install:
-                kind_text = "手动安装"
             tree.insert(
                 "",
                 tk.END,
                 iid=str(idx),
-                values=(
-                    trust_text,
-                    cand.title,
-                    cand.source_site,
-                    kind_text,
-                    cand.language or "-",
-                    cand.url,
-                ),
+                values=format_candidate_row(cand),
             )
 
         btn_bar = ttk.Frame(dialog, padding=(10, 4, 10, 4))
@@ -1178,10 +1154,7 @@ class GalgamePatcherGUI:
                 exec_warn_var.set("")
                 return
             cand = candidates[int(sel[0])]
-            if cand.bare_executable:
-                exec_warn_var.set("⚠ 该链接指向可执行文件，请谨慎下载")
-            else:
-                exec_warn_var.set("\n".join(filter(None, (cand.description, cand.trust_reason))))
+            exec_warn_var.set(format_candidate_detail(cand))
 
         def _open_browser(_event: object = None) -> None:
             sel = tree.selection()
@@ -1275,7 +1248,8 @@ class GalgamePatcherGUI:
             if not cfg_path.is_file():
                 save_user_sources()
             if sys.platform == "win32":
-                os.startfile(str(cfg_path))  # type: ignore[attr-defined]
+                startfile = os.startfile
+                startfile(str(cfg_path))
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", str(cfg_path)])
             else:
@@ -1297,23 +1271,9 @@ class GalgamePatcherGUI:
             return
         game_dir = self.game_dir_var.get().strip()
         patch_source = self.patch_source_var.get().strip()
-        if not game_dir:
-            messagebox.showwarning("缺少参数", "请先指定或扫描得到游戏安装目录。")
-            return
-        if not patch_source:
-            messagebox.showwarning(
-                "缺少补丁源", "请先通过『选择补丁文件...』导入本地补丁文件。"
-            )
-            return
-
-        # GUI 侧彻底禁止从 URL 直接安装补丁
-        if is_url(patch_source) or patch_source.lower().startswith(("http://", "https://")):
-            messagebox.showwarning(
-                "已禁止从 URL 直接安装",
-                "出于安全考虑，本工具不再支持从 URL 直接安装补丁。\n"
-                "请用『自动上网搜索』拿到链接，在浏览器下载后，\n"
-                "用『选择补丁文件...』导入本地文件。",
-            )
+        validation_warning = validate_patch_task_inputs(game_dir, patch_source)
+        if validation_warning is not None:
+            messagebox.showwarning(*validation_warning)
             return
 
         password = self.password_var.get().strip() or None
@@ -1326,19 +1286,10 @@ class GalgamePatcherGUI:
                 return
             # 危险操作二次确认（P3-1 #6）
             if not dry_run:
-                backup_note = (
-                    "已备份至 .galpatch_backup" if backup else "注意：已取消勾选自动备份"
+                confirm_msg = format_apply_confirm_message(
+                    game_dir, backup=backup, expected_sha256=expected_sha256
                 )
-                hash_note = (
-                    ""
-                    if expected_sha256
-                    else "\n未填写发布者的 SHA256，请确认文件来自可信来源。"
-                )
-                if not messagebox.askyesno(
-                    "确认安装补丁",
-                    f"即将把补丁安装到游戏目录:\n{game_dir}\n\n"
-                    f"将覆盖同名文件（{backup_note}）。{hash_note}\n确定继续吗？",
-                ):
+                if not messagebox.askyesno("确认安装补丁", confirm_msg):
                     return
             self._start_patch_task(
                 dry_run=dry_run,
@@ -1382,15 +1333,10 @@ class GalgamePatcherGUI:
         start_time = time.monotonic()
 
         def _progress_cb(downloaded: int, total: Optional[int]) -> None:
-            elapsed = max(0.001, time.monotonic() - start_time)
-            speed_str = _format_speed(downloaded / elapsed)
-            if total and total > 0:
-                pct = min(99.0, downloaded * 100.0 / total)
-                msg = f"正在下载补丁: {pct:.1f}% ({downloaded}/{total} 字节, {speed_str})"
-                self._ui_queue.put(("progress", pct, msg))
-            else:
-                msg = f"正在下载补丁: {downloaded} 字节 ({speed_str})"
-                self._ui_queue.put(("progress", 50.0, msg))
+            pct, msg = compute_download_progress(
+                downloaded, total, time.monotonic() - start_time
+            )
+            self._ui_queue.put(("progress", pct, msg))
 
         def _worker() -> None:
             try:
@@ -1408,15 +1354,14 @@ class GalgamePatcherGUI:
                     self._ui_queue.put(("error", f"{result.message}\n{result.failure_details()}".rstrip()))
                 else:
                     self._ui_queue.put(("success", result.message, not dry_run))
-            except GameRunningError as exc:
-                logger.warning("检测到游戏文件被占用: %s", exc)
-                self._ui_queue.put(("warning", "游戏正在运行或文件被占用", str(exc)))
-            except ConcurrencyError as exc:
-                logger.warning("检测到并发实例锁冲突: %s", exc)
-                self._ui_queue.put(("warning", "另一个实例正在运行", str(exc)))
             except Exception as exc:
-                logger.exception("补丁操作异常")
-                self._ui_queue.put(("error", str(exc)))
+                kind, title, detail = format_patch_exception(exc, operation="apply")
+                if isinstance(exc, (GameRunningError, ConcurrencyError)):
+                    logger.warning("补丁操作受阻 (%s): %s", type(exc).__name__, exc)
+                    self._ui_queue.put((kind, title, detail))
+                else:
+                    logger.exception("补丁操作异常")
+                    self._ui_queue.put((kind, detail))
             finally:
                 self._install_active = False
 
@@ -1507,15 +1452,14 @@ class GalgamePatcherGUI:
                     self._ui_queue.put(("success", result.message, True))
                 else:
                     self._ui_queue.put(("error", f"{result.message}\n{result.failure_details()}".rstrip()))
-            except GameRunningError as exc:
-                logger.warning("回滚时文件被占用: %s", exc)
-                self._ui_queue.put(("warning", "文件被占用", str(exc)))
-            except ConcurrencyError as exc:
-                logger.warning("回滚时并发冲突: %s", exc)
-                self._ui_queue.put(("warning", "并发冲突", str(exc)))
             except Exception as exc:
-                logger.exception("回滚异常")
-                self._ui_queue.put(("error", str(exc)))
+                kind, title, detail = format_patch_exception(exc, operation="rollback")
+                if isinstance(exc, (GameRunningError, ConcurrencyError)):
+                    logger.warning("回滚受阻 (%s): %s", type(exc).__name__, exc)
+                    self._ui_queue.put((kind, title, detail))
+                else:
+                    logger.exception("回滚异常")
+                    self._ui_queue.put((kind, detail))
             finally:
                 self._install_active = False
 
